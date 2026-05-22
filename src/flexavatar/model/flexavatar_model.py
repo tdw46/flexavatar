@@ -133,21 +133,10 @@ class HeadTransformer(nn.Module):
         else:
             raise ValueError(f"Unknown head transformer type: {config.head_transformer_type}")
 
-        if config.use_head_xyz_input or config.use_lam_point_embedder:
+        if config.use_lam_point_embedder:
             self.register_buffer("_initial_head_xyz", initial_head_xyz, persistent=False)
-            if config.use_head_xyz_input:
-                self._head_xyz_mlp = MLP(config.transformer.d_hidden + 3, [4 * config.transformer.d_hidden, config.transformer.d_hidden],
-                                         activation_layer=GELU)
-
             if config.use_lam_point_embedder:
                 self._query_point_embedder = PointEmbed(dim=config.transformer.d_hidden)
-
-        if config.use_image_token_embeddings:
-            self._image_token_embeddings = nn.Parameter(
-                torch.zeros((config.n_input_views * config.res_image_tokens ** 2, 1, config.transformer.d_hidden)))  # [VHT, 1, D]
-            # nn.init.normal_(self._image_token_embeddings, mean=0.0, std=0.02)
-            # nn.init.normal_(self._image_token_embeddings, mean=0.0, std=0.2)
-            nn.init.trunc_normal_(self._image_token_embeddings)
 
         if config.use_lam_transformer:
             self._transformer = TransformerDecoder('sd3_cond', config.transformer.n_layers, config.transformer.n_heads, config.transformer.d_hidden,
@@ -175,74 +164,18 @@ class HeadTransformer(nn.Module):
             else:
                 self._expression_transformer = Transformer(config.transformer)
 
-        if config.d_residual_codes is not None:
-            self._residual_mlp = MLP(config.d_residual_codes,
-                                     [256] * 2 + [
-                                         config.transformer.d_hidden if config.n_residual_tokens is None else config.transformer.d_hidden * config.n_residual_tokens],
-                                     activation_layer=torch.nn.ReLU)
-
-            self._residual_transformer = TransformerDecoder('sd3_cond',
-                                                            config.transformer.n_layers, config.transformer.n_heads, config.transformer.d_hidden,
-                                                            cond_dim=config.transformer.d_hidden,
-                                                            use_ada_ln=False,
-                                                            transform_keys=False)  # TODO: cond_dim could be different
-
-            for layer in self._residual_transformer.layers:
-                layer.ff.net[-1].weight.data[:] = 0
-                layer.ff.net[-1].bias.data[:] = 0
-                layer.attn.to_out[0].weight.data[:] = 0
-                layer.attn.to_out[0].bias.data[:] = 0
-                # torch.nn.init.zeros_(layer.ff.net[-1].weight)
-                # torch.nn.init.zeros_(layer.ff.net[-1].bias)
-                # torch.nn.init.zeros_(layer.attn.to_out[0].weight)
-                # torch.nn.init.zeros_(layer.attn.to_out[0].bias)
-            # self._residual_transformer.layers[i].ff.net[-1].weight / bias
-            # self._residual_transformer.layers[i].attn.to_out[0]
-
         if self._config.use_dataset_ids:
-            if self._config.use_separate_dataset_ids:
-                n_dataset_ids = len(DATASET_ID_MAPPING)
-            elif self._config.use_nersemble_dataset_ids:
-                n_dataset_ids = 17
-            else:
-                n_dataset_ids = 2
+            n_dataset_ids = 2
             self._dataset_embedding = nn.Embedding(n_dataset_ids, config.transformer.d_hidden)
-
-        if self._config.use_ln_before_transformer:
-            self._query_ln = LayerNorm(config.transformer.d_hidden)
-            self._input_ln = LayerNorm(config.transformer.d_hidden)
-
-            if self._config.use_image_token_embeddings:
-                self._image_token_embeddings_ln = LayerNorm(config.transformer.d_hidden)
 
         # nn.init.trunc_normal_(self._head_token_embeddings, std=0.02)
         nn.init.trunc_normal_(self._head_token_embeddings)
-
-        if self._config.use_backprojected_xyz_input:
-            # Maps [D + 3] -> [D]
-            self._backprojected_xyz_mlp = MLP(config.transformer.d_hidden + 3, [4 * config.transformer.d_hidden, config.transformer.d_hidden],
-                                              activation_layer=GELU)
-
-            if self._config.use_image_token_embeddings:
-                self._backprojected_xyz_image_token_embeddings_mlp = MLP(config.transformer.d_hidden + 3,
-                                                                         [4 * config.transformer.d_hidden, config.transformer.d_hidden],
-                                                                         activation_layer=GELU)
-
-        if config.use_representation_compressor:
-            self._representation_compressor = RepresentationCompressor(RepresentationCompressorConfig(config.res_head_tokens,
-                                                                                                      config.n_compression_steps,
-                                                                                                      config.n_layers_per_compression,
-                                                                                                      config.transformer.d_hidden,
-                                                                                                      config.transformer.n_heads,
-                                                                                                      use_lam_point_embedder=not config.use_learnable_compression_queries,
-                                                                                                      head_template=config.head_template))
 
     def forward(self, x: torch.Tensor,
                 condition: Optional[torch.Tensor] = None,
                 input_cam2worlds: Optional[List[List[Pose]]] = None,
                 input_intrinsics: Optional[List[List[Intrinsics]]] = None,
                 expression_codes: Optional[torch.Tensor] = None,
-                residual_codes: Optional[torch.Tensor] = None,
                 dataset_ids: Optional[torch.Tensor] = None,
                 cached_internal_representations: Optional[torch.Tensor] = None,
                 only_internal_representations: bool = False,
@@ -258,72 +191,23 @@ class HeadTransformer(nn.Module):
                 queries = self._head_token_embeddings.repeat(1, B, 1).to(x.dtype)
             pixel_aligned_predictions = None
 
-            backprojected_xyz = None
-            if self._config.use_backprojected_xyz_input:
-                res_input = self._config.res_image_tokens  # int(sqrt(x.shape[0]))  # TODO: Only works with single input image
-                backprojected_xyz = get_unprojected_points(input_cam2worlds, input_intrinsics, res_input, x.dtype, x.device)
-                backprojected_xyz = backprojected_xyz.permute(1, 0, 2)
-
-                x = x + self._backprojected_xyz_mlp(torch.cat([x, backprojected_xyz], dim=-1))
-
-            if self._config.use_head_xyz_input:
-                initial_head_xyz = self._initial_head_xyz.repeat(B, 1, 1).permute(1, 0, 2)
-                queries = queries + self._head_xyz_mlp(torch.cat([queries, initial_head_xyz], dim=-1))
-
-            # p = pv.Plotter()
-            # p.add_points(initial_head_xyz[:, 0].float().detach().cpu().numpy(), color='red')
-            # p.add_points(backprojected_xyz[:, 0].float().detach().cpu().numpy(), color='blue')
-            # for pose, intr in zip(input_cam2worlds[0], input_intrinsics[0]):
-            #     add_camera_frustum(p, pose, intr.rescale(128, inplace=False))
-            # add_coordinate_axes(p, scale=0.1)
-            # p.show()
-
-            if self._config.use_ln_before_transformer:
-                queries = self._query_ln(queries)
-                x = self._input_ln(x)
-
             if condition is not None and len(condition.shape) == 3:
                 # TODO: Decoder cannot really make use of timestep condition of multiple input images. Hence, only using the condition of the first timestep here
                 condition = condition[:, 0]
 
             if self._config.cross_attention_type == CrossAttentionType.Q2K:
-                if self._config.use_image_token_embeddings:
-                    image_queries = self._image_token_embeddings.repeat(1, B, 1).to(x.dtype)
-                    if self._config.use_backprojected_xyz_input:
-                        image_queries = image_queries + self._backprojected_xyz_image_token_embeddings_mlp(
-                            torch.cat([image_queries, backprojected_xyz], dim=-1))
-                    if self._config.use_ln_before_transformer:
-                        image_queries = self._image_token_embeddings_ln(image_queries)
-                    qi = torch.cat([queries, image_queries], dim=0)
-                    x = self._transformer(qi, keys=x, condition=condition)
-                    pixel_aligned_predictions = x[-len(image_queries):]
-                    x = x[:len(queries)]
-                else:
-                    x = self._transformer(queries, keys=x, condition=condition)
+                x = self._transformer(queries, keys=x, condition=condition)
             elif self._config.cross_attention_type == CrossAttentionType.Q2QK:
                 qk = torch.cat([queries, x], dim=0)
                 x = self._transformer(queries, keys=qk, condition=condition)
             elif self._config.cross_attention_type == CrossAttentionType.QK2QK:
-                if self._config.use_image_token_embeddings:
-                    image_queries = self._image_token_embeddings.repeat(1, B, 1).to(x.dtype)
-                    if self._config.use_backprojected_xyz_input:
-                        image_queries = image_queries + self._backprojected_xyz_image_token_embeddings_mlp(
-                            torch.cat([image_queries, backprojected_xyz], dim=-1))
-                    if self._config.use_ln_before_transformer:
-                        image_queries = self._image_token_embeddings_ln(image_queries)
-                    qki = torch.cat([queries, x, image_queries], dim=0)
-                    x = self._transformer(qki, condition=condition)
-                    pixel_aligned_predictions = x[-len(image_queries):]
-                else:
-                    qk = torch.cat([queries, x], dim=0)
-                    x = self._transformer(qk, condition=condition)
-                    pixel_aligned_predictions = x[len(queries):]
+                qk = torch.cat([queries, x], dim=0)
+                x = self._transformer(qk, condition=condition)
+                pixel_aligned_predictions = x[len(queries):]
                 x = x[:len(queries)]
             else:
                 raise ValueError(f"Unknown cross attention type: {self._config.cross_attention_type}")
 
-            if self._config.use_representation_compressor:
-                x = self._representation_compressor.compress(x)
         else:
             x = cached_internal_representations[:self._head_token_embeddings.shape[0]]
             pixel_aligned_predictions = cached_internal_representations[self._head_token_embeddings.shape[0]:]
@@ -339,9 +223,6 @@ class HeadTransformer(nn.Module):
 
         if only_internal_representations:
             return x, pixel_aligned_predictions, internal_representation, vae_output
-
-        if self._config.use_representation_compressor:
-            x = self._representation_compressor.decompress(x)
 
         B = x.shape[1]
 
@@ -361,18 +242,9 @@ class HeadTransformer(nn.Module):
                 condition = condition.repeat_interleave(expression_codes.shape[1], dim=0)
 
             if self._config.use_dataset_ids:
-                if self._config.use_nersemble_dataset_ids and dataset_ids[0, 0] == 9999:
-                    # Average over NeRSemble dataset IDs
-                    dataset_tokens = self._dataset_embedding(torch.arange(16, device=x.device)).mean(dim=0)
-                    dataset_tokens = dataset_tokens[None, None]
-                else:
-                    dataset_tokens = self._dataset_embedding(dataset_ids)
-                if self._config.use_nersemble_dataset_ids:
-                    # In case of NeRSemble dataset IDs ablation, no repeat is necessary, since the IDs are per target image and not per sample
-                    dataset_tokens = dataset_tokens.flatten(0, 1)[None]  # [1, B, D]
-                else:
-                    dataset_tokens = dataset_tokens.permute(1, 0, 2)  # [1, B, D]
-                    dataset_tokens = dataset_tokens.repeat_interleave(expression_codes.shape[1], dim=1)
+                dataset_tokens = self._dataset_embedding(dataset_ids)
+                dataset_tokens = dataset_tokens.permute(1, 0, 2)  # [1, B, D]
+                dataset_tokens = dataset_tokens.repeat_interleave(expression_codes.shape[1], dim=1)
                 expression_tokens = torch.cat([dataset_tokens, expression_tokens], dim=0)
 
         if self._config.d_expression_codes:
@@ -381,101 +253,7 @@ class HeadTransformer(nn.Module):
                 pixel_aligned_predictions = x[-len(pixel_aligned_predictions):]
                 x = x[:-len(pixel_aligned_predictions)]
 
-        if self._config.d_residual_codes is not None:
-            B = x.shape[1]
-
-            if pixel_aligned_predictions is not None:
-                x = torch.cat([x, pixel_aligned_predictions])
-
-            if self._config.n_residual_tokens is None:
-                residual_tokens = self._residual_mlp(residual_codes).flatten(0, 1)
-            else:
-                residual_tokens = self._residual_mlp(residual_codes).reshape(B,
-                                                                             self._config.n_residual_tokens,
-                                                                             self._config.transformer.d_hidden)
-            residual_tokens = residual_tokens.permute(1, 0, 2)
-
-            x = self._residual_transformer(x, keys=residual_tokens, condition=condition)
-            if pixel_aligned_predictions is not None:
-                pixel_aligned_predictions = x[-len(pixel_aligned_predictions):]
-                x = x[:-len(pixel_aligned_predictions)]
-
         return x, pixel_aligned_predictions, internal_representation, vae_output
-
-
-@dataclass
-class RepresentationCompressorConfig(Config):
-    resolution: int
-    n_compression_steps: int
-    n_layers_per_compression: int
-    d_hidden: int
-    n_heads: int
-    use_lam_point_embedder: bool
-    head_template: str = 'gghead_template'
-
-
-class CompressionLayer(nn.Module):
-    def __init__(self, config: RepresentationCompressorConfig, resolution: int):
-        super().__init__()
-        self._config = config
-
-        if config.use_lam_point_embedder:
-            _, _, position_map = sample_template_positions(resolution, config.head_template)
-            position_map = position_map.reshape(1, resolution ** 2, 3)
-            self._query_point_embedder = PointEmbed(dim=config.d_hidden)
-            self.register_buffer('_position_map', position_map, persistent=False)
-        else:
-            self._learnable_queries = nn.Parameter(torch.zeros((resolution ** 2, 1, config.d_hidden)))
-            nn.init.trunc_normal_(self._learnable_queries)
-
-        self._transformer = TransformerDecoder('sd3_cond', config.n_layers_per_compression, config.n_heads, config.d_hidden,
-                                               cond_dim=config.d_hidden)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self._config.use_lam_point_embedder:
-            queries = self._query_point_embedder(self._position_map).permute(1, 0, 2).repeat(1, x.shape[1], 1).to(x.dtype)
-        else:
-            queries = self._learnable_queries.repeat(1, x.shape[1], 1).to(x.dtype)
-
-        x = self._transformer(queries, x)
-        return x
-
-
-class RepresentationCompressor(nn.Module):
-    def __init__(self, config: RepresentationCompressorConfig):
-        super().__init__()
-        self._config = config
-
-        compression_layers = []
-        decompression_layers = []
-
-        resolution = config.resolution
-        for i_step in range(config.n_compression_steps):
-            lower_res = resolution // 2
-            compression_layers.append(CompressionLayer(config, lower_res))
-            resolution = lower_res
-
-        for i_step in range(config.n_compression_steps):
-            higher_res = resolution * 2
-            decompression_layers.append(CompressionLayer(config, higher_res))
-            resolution = higher_res
-
-        self._compression_layers = nn.ModuleList(compression_layers)
-        self._decompression_layers = nn.ModuleList(decompression_layers)
-
-    def compress(self, x: torch.Tensor) -> torch.Tensor:
-        # Downsampling
-        for i_step in range(self._config.n_compression_steps):
-            x = self._compression_layers[i_step](x)
-
-        return x
-
-    def decompress(self, x: torch.Tensor) -> torch.Tensor:
-        # Upsampling
-        for i_step in range(self._config.n_compression_steps):
-            x = self._decompression_layers[i_step](x)
-
-        return x
 
 
 def unproject_depth(depth_map, fxfycxcy, c2w):
@@ -905,10 +683,7 @@ class GaussianHeadLRM(nn.Module):
                 n_layer=config.n_layers_encoder,
                 n_head=config.head_transformer.transformer.n_heads,
                 n_embd=config.head_transformer.transformer.d_hidden,
-                use_repa=config.head_transformer.use_repa,
-                repa_layer=config.head_transformer.repa_layer,
-                d_repa_target=config.head_transformer.d_repa_target,
-                use_post_layer_norm=config.head_transformer.use_transformer_encoder_ln,
+                use_post_layer_norm=True,
                 n_merged_views=1 if config.encode_images_separately else config.n_input_views,
                 use_causal_attention=config.head_transformer.transformer.use_causal_attention,
                 patch_size=config.patch_size
@@ -1022,27 +797,16 @@ class GaussianHeadLRM(nn.Module):
 
                 # encode image tokens
                 xs = [x]
-                conditions = [condition]
-
-                prope_poses = None
-                prope_intrinsics = None
 
                 if self._config.encode_images_separately:
                     xs = [rearrange(x, 'b v c h w -> (h w) (b v) c') for x in xs]
-                    conditions_encoder = [condition.flatten(0, 1) if len(condition.shape) == 3 else condition for condition in conditions]
                 else:
                     xs = [rearrange(x, 'b v c h w -> (v h w) b c') for x in xs]
-                    conditions_encoder = conditions
 
-                if self._config.head_transformer.use_repa:
-                    x, x_repa = self._transformer_encoder(xs[0], condition=conditions_encoder[0], poses=prope_poses, intrinsics=prope_intrinsics)
-                else:
-                    x = self._transformer_encoder(xs[0])
+                x = self._transformer_encoder(xs[0])
 
                 if self._config.encode_images_separately:
                     x = rearrange(x, '(h w) (b v) c -> (v h w) b c', h=H_p, w=W_p, b=B, v=V)
-                    if x_repa is not None:
-                        x_repa = rearrange(x_repa, '(b v) (h w) c -> b (v h w) c', h=H_p, w=W_p, b=B, v=V)
 
                 if self._config.use_feature_projection and not self._config.add_features_before_encoder and features is not None:
                     x = add_image_features(x)
