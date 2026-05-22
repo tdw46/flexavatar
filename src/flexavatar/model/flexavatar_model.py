@@ -7,7 +7,7 @@ from typing import Optional, List, Tuple, Union, Dict
 import numpy as np
 import torch
 from dreifus.camera import PoseType
-from dreifus.graphics import Dimensions
+from dreifus.image import torch_to_numpy_img
 from dreifus.matrix import Pose, Intrinsics
 from dreifus.render import project
 from dreifus.vector import Vec3
@@ -18,23 +18,17 @@ from gaussian_splatting.gaussian_renderer import render_distwar, render_gsplat_b
 from gaussian_splatting.scene import GaussianModel
 from gaussian_splatting.scene.cameras import pose_to_rendercam
 from gaussian_splatting.utils.sh_utils import C0, eval_sh
-from photoreal_3dmm.dataset.config import InputType, GaussianHeadLRMBatch, RenderType, DATASET_ID_MAPPING
-from photoreal_3dmm.env import ASSETS_PATH
-from photoreal_3dmm.model.DPR.DPR import DPR
-from photoreal_3dmm.model.cgs.point_generator import PointGenerator, PointGeneratorConfig
-from photoreal_3dmm.model.cnn import CNNDecoder
-from photoreal_3dmm.model.dit import TimestepEmbedder, DiT
-from photoreal_3dmm.model.flame.flame_deformer import FlameDeformer, expression_codes_to_flame_params
-from photoreal_3dmm.model.lam_gs_layer import GSLayer
-from photoreal_3dmm.model.lam_point_embedder import PointEmbed
-from photoreal_3dmm.model.lam_transformer import TransformerDecoder
-from photoreal_3dmm.model.mlp_bundle import MLPBundle
-from photoreal_3dmm.model.nanogpt_orig import GPTConfig, GPT
-from photoreal_3dmm.model.res_att_block import ResidualAttentionBlock
-from photoreal_3dmm.model.stylegan_upsampler import StyleGANUpsampler, StyleGANUpsamplerConfig, StyleGANPixelShuffleUpsampler
-from photoreal_3dmm.model.vae import VAEModule, VAEOutput
-from photoreal_3dmm.util.plucker import plucker_embedder
-from photoreal_3dmm.util.uv import gen_tritex
+
+from flexavatar.config.dataset_config import DATASET_ID_MAPPING, GaussianHeadLRMBatch, MVDatasetConfig
+from flexavatar.env import ASSETS_PATH
+from flexavatar.model.flexavatar_preprocessor import GaussianHeadLRMPreprocessor
+from flexavatar.model.lam_gs_layer import GSLayer
+from flexavatar.model.lam_point_embedder import PointEmbed
+from flexavatar.model.lam_transformer import TransformerDecoder
+from flexavatar.model.nanogpt import GPTConfig, GPT
+from flexavatar.model.stylegan_upsampler import StyleGANUpsamplerConfig, StyleGANPixelShuffleUpsampler
+from flexavatar.util.plucker import plucker_embedder
+from flexavatar.util.uv import gen_tritex
 from torch import nn, device
 from torch.nn import GELU, LayerNorm, PixelShuffle, Identity
 from torch.nn.functional import interpolate
@@ -156,13 +150,13 @@ class HeadTransformerConfig(Config):
     cross_attention_type: CrossAttentionType = CrossAttentionType.Q2K
     use_lam_transformer: bool = False
     use_lam_point_embedder: bool = False
-    use_gpt: bool = False
-    use_adaptive_layer_norm: bool = False
-    init_adaptive_layer_norm_identity: bool = False
+    use_gpt: bool = False  # remove
+    use_adaptive_layer_norm: bool = False  # remove
+    init_adaptive_layer_norm_identity: bool = False  # remove
     res_image_tokens: Optional[int] = None
     n_input_views: int = 1
     use_image_token_embeddings: bool = False
-    use_pixel_aligned_gaussians: bool = False
+    use_pixel_aligned_gaussians: bool = False  # remove
     use_repa: bool = False
     repa_layer: int = -1
     d_repa_target: int = 768
@@ -178,8 +172,8 @@ class HeadTransformerConfig(Config):
     n_residual_tokens: Optional[int] = None
     use_head_tokens: bool = True
     n_layers_expression_transformer: int = 4
-    use_vae: bool = False
-    use_point_generator: bool = False
+    use_vae: bool = False  # remove
+    use_point_generator: bool = False  # remove
     n_point_generator_layers: int = 6
     use_dataset_ids: bool = False
     use_separate_dataset_ids: bool = False
@@ -231,33 +225,6 @@ class HeadTransformer(nn.Module):
                                                    cond_dim=config.transformer.d_hidden,
                                                    use_ada_ln=config.use_adaptive_layer_norm,
                                                    transform_keys=config.use_pixel_aligned_gaussians)  # TODO: cond_dim could be different
-        elif config.use_gpt:
-            max_n_input_tokens = self._head_token_embeddings.shape[0]
-            if config.cross_attention_type == CrossAttentionType.Q2K and config.use_image_token_embeddings:
-                max_n_input_tokens += self._image_token_embeddings.shape[0]
-            elif config.cross_attention_type == CrossAttentionType.Q2QK or config.cross_attention_type == CrossAttentionType.QK2QK:
-                if config.block_size_estimate_version == 3:
-                    max_n_input_tokens += config.n_input_views * config.res_image_tokens ** 2
-
-                    if config.use_image_token_embeddings:
-                        max_n_input_tokens += self._image_token_embeddings.shape[0]
-                elif config.block_size_estimate_version == 2:
-                    max_n_input_tokens += 2 * config.res_image_tokens ** 2
-                else:
-                    max_n_input_tokens *= 2
-
-            gpt_config = GPTConfig(
-                block_size=max_n_input_tokens,
-                n_layer=config.transformer.n_layers,
-                n_head=config.transformer.n_heads,
-                n_embd=config.transformer.d_hidden,
-                use_cross_attention=config.cross_attention_type != CrossAttentionType.QK2QK,
-                use_adaptive_layer_norm=config.use_adaptive_layer_norm,
-                init_adaptive_layer_norm_identity=config.init_adaptive_layer_norm_identity,
-                use_post_layer_norm=config.use_transformer_decoder_ln,
-                use_causal_attention=config.transformer.use_causal_attention,
-            )
-            self._transformer = GPT(gpt_config)
         else:
             self._transformer = Transformer(config.transformer)
 
@@ -275,9 +242,7 @@ class HeadTransformer(nn.Module):
                                                                   cond_dim=config.transformer.d_hidden,
                                                                   use_ada_ln=config.use_adaptive_layer_norm,
                                                                   transform_keys=config.use_pixel_aligned_gaussians)  # TODO: cond_dim could be different
-            elif config.use_gpt:
-                expression_transformer_config = replace(gpt_config, use_cross_attention=True)
-                self._expression_transformer = GPT(expression_transformer_config)
+
             else:
                 self._expression_transformer = Transformer(config.transformer)
 
@@ -691,10 +656,10 @@ class GaussianDecoderConfig(Config):
     res_image_tokens: Optional[int] = None
     upscale_uv_texture: Optional[int] = None
     head_transformer_type: HeadTransformerType = HeadTransformerType.MESH_TOKENS
-    use_separate_mlps: bool = False
-    use_stylegan_upsampler: bool = False
+    use_separate_mlps: bool = False  # remove
+    use_stylegan_upsampler: bool = False  # remove
     use_stylegan_pixelshuffle_upsampler: bool = False
-    use_pixel_aligned_gaussians: bool = False
+    use_pixel_aligned_gaussians: bool = False  # remove
     sample_aligned_gaussians: bool = False
     use_norm_before_mlp: bool = True
     initialize_with_image: bool = False
@@ -702,7 +667,7 @@ class GaussianDecoderConfig(Config):
     use_variance_channels: bool = False
     fix_mlp_order: bool = False
     use_color_skip: bool = False
-    use_mesh_color_init: bool = False
+    use_mesh_color_init: bool = False  # remove
     init_zero_color: bool = False
     init_zero_variance: bool = False
     use_variance_activation: bool = False
@@ -713,14 +678,14 @@ class GaussianDecoderConfig(Config):
     use_lam_gs_decoder: bool = False
     use_gaussians: bool = True  # If False, simply decode 1 pixel value per pixel_aligned_token
     use_vae: bool = False
-    expand_feature_maps: int = 1  # By how much feature map channels should be up-projected before feature map is upscaled (and looses channels)
+    expand_feature_maps: int = 1  # remove
     make_contiguous: bool = False
-    use_flame_deformer: bool = False
-    use_pixel3dmm_flame_deformer: bool = False
-    flame_deformer_type: str = 'post'
+    use_flame_deformer: bool = False  # remove
+    use_pixel3dmm_flame_deformer: bool = False  # remove
+    flame_deformer_type: str = 'post'  # remove
     sh_degree: int = 0
     head_template: str = 'gghead_template'
-    use_expression_code_ws: bool = False
+    use_expression_code_ws: bool = False  # remove
     d_expression_codes: Optional[int] = None
 
 
@@ -821,24 +786,6 @@ class GaussianDecoder(nn.Module):
             from photoreal_3dmm.model.flame.pixel3dmm_flame_deformer import Pixel3DMMFlameDeformer
             self._flame_deformer = Pixel3DMMFlameDeformer(config.res_head_tokens)
 
-        # G = initial_gaussian_positions.shape[1] * self._config.n_gaussians_per_token
-        # self._xyz = torch.nn.Parameter(self._initial_gaussian_positions[0].repeat_interleave(self._config.n_gaussians_per_token, dim=0))
-        # self._rotation = torch.nn.Parameter(torch.normal(0, 0.02, (G, 4), device=self.device))
-        # self._scaling = torch.nn.Parameter(torch.clip(torch.normal(0, 0.02, (G, 3), device=self.device) + self._config.scale_offset, max=self._config.scale_max))
-        # self._features_dc = torch.nn.Parameter(torch.normal(0, 0.02, (G, 1, 3), device=self.device))
-        # self._features_rest = torch.nn.Parameter(torch.empty(
-        #     (self._features_dc.shape[0], 0, self._features_dc.shape[2]), device=self.device))
-        # self._opacity = torch.nn.Parameter(torch.normal(0, 0.02, (G, 1), device=self.device))
-        #
-        # self._dummy_mlp = MLP(config.d_hidden, [config.d_hidden] * (config.n_mlp_layers - 1) + [(3 + 3 + 4 + 1 + 3) * G],
-        #                         activation_layer=GELU)
-        # self._dummy_mlp_input = torch.nn.Parameter(torch.randn((1, config.d_hidden), device=self.device))
-        # for p in self._dummy_mlp.parameters():
-        #     if p.dim() > 1:
-        #         nn.init.normal_(p, mean=0, std=0.02)
-        #
-        # self._dummy_tokens = torch.nn.Parameter(torch.randn((1, 64*64, config.d_hidden), device=self.device))
-
     @property
     def device(self):
         return self._device_indicator.device
@@ -905,29 +852,6 @@ class GaussianDecoder(nn.Module):
             uv_texture = x.permute(0, 3, 1, 2)  # [BV, C, H, W]
 
             sampled_features = self._upsample_feature_map(uv_texture, perform_sampling=perform_sampling, aligned=aligned, expression_codes=expression_codes)
-            # if self._config.upscale_uv_texture is not None:
-            #     if self._config.use_stylegan_upsampler or self._config.use_stylegan_pixelshuffle_upsampler:
-            #         with torch.autocast(device_type="cuda", enabled=False):
-            #             if aligned:
-            #                 # Upsample back-projected image tokens
-            #                 uv_texture = self._stylegan_upsampler_aligned(uv_texture.float())
-            #             else:
-            #                 # Upsample head tokens
-            #                 uv_texture = self._stylegan_upsampler(uv_texture.float())
-            #     else:
-            #         uv_texture = self._uv_texture_pixel_shuffle(uv_texture)
-            #
-            # if perform_sampling:
-            #     if aligned:
-            #         uv_samples = self._uv_samples_aligned.repeat(x.shape[0], 1, 1, 1)  # [BV, G_aligned, 1, 2]
-            #     else:
-            #         uv_samples = self._uv_samples.repeat(x.shape[0], 1, 1, 1)  # [BV, G, 1, 2]
-            #
-            #     sampled_features = torch.nn.functional.grid_sample(uv_texture, uv_samples)[:, :, :, 0]  # [BV, D, G]
-            #     sampled_features = sampled_features.permute(0, 2, 1)
-            # else:
-            #     sampled_features = uv_texture.flatten(2, 3)
-            #     sampled_features = sampled_features.permute(0, 2, 1)
 
             sampled_features = sampled_features.reshape(B, v * sampled_features.shape[-2], sampled_features.shape[-1])  # [B*E, V*H*W, D]
 
@@ -1088,16 +1012,6 @@ class GaussianDecoder(nn.Module):
                     sampled_input_rgb = (sampled_input_rgb - 0.5) / C0
                     colors_aligned[..., :3] = colors_aligned[..., :3] + sampled_input_rgb
 
-                # import pyvista as pv
-                # from dreifus.pyvista import add_camera_frustum, add_coordinate_axes
-                # p = pv.Plotter()
-                # # p.add_points(xyz_init[0].detach().float().cpu().numpy(), color='blue')
-                # p.add_points(xyz_init[0].detach().float().cpu().numpy(), scalars=colors_aligned[0].detach().float().cpu().numpy()[..., :3], rgb=True)
-                # p.add_points(self._initial_gaussian_positions[0].detach().float().cpu().numpy(), color='red')
-                # add_camera_frustum(p, input_cam2worlds[0][0], input_intrinsics[0][0])
-                # add_coordinate_axes(p, scale=0.1)
-                # p.show()
-
                 if self._config.predict_depth:
                     positions_aligned = xyz_init
                 else:
@@ -1174,15 +1088,6 @@ class GaussianDecoder(nn.Module):
                     gaussian_model._features_rest = colors_sh[i]
                 gaussian_models.append(gaussian_model)
 
-                # dummy_gaussian_model = GaussianModel(sh_degree=0)
-                # dummy_gaussian_model._xyz = self._xyz
-                # dummy_gaussian_model._scaling = self._scaling
-                # dummy_gaussian_model._rotation = self._rotation
-                # dummy_gaussian_model._features_dc = self._features_dc
-                # dummy_gaussian_model._features_rest = self._features_rest
-                # dummy_gaussian_model._opacity = self._opacity
-                # gaussian_models.append(dummy_gaussian_model)
-
         else:
             b, v, c, h, w = pixel_aligned_predictions.shape
             pixel_aligned_predictions = rearrange(pixel_aligned_predictions, 'b v c h w -> (b v) c h w')
@@ -1230,16 +1135,16 @@ class GaussianHeadLRMConfig(Config):
     compute_headpose_sh: bool = False
     normalize_images: bool = False
     encode_images_separately: bool = False
-    use_clean_image_encoder: bool = False  # Use separate image encoder for clean conditioning views
-    use_residual_encoder: bool = False
-    use_dpr_lighting: bool = False
+    use_clean_image_encoder: bool = False  # remove
+    use_residual_encoder: bool = False  # remove
+    use_dpr_lighting: bool = False  # remove
     residual_downsample: int = 4  # Ensure target images cannot leak too much by forcing downsampling
     n_layers_residual_encoder: int = 4
-    use_prope: bool = False
+    use_prope: bool = False  # remove
     use_plucker: bool = False
     use_rppc: bool = False  # Reference-Point Plucker Coordinates
 
-    use_neural_renderer: bool = False
+    use_neural_renderer: bool = False  # remove
     compile: bool = False
     use_gsplat: bool = False
 
@@ -1257,7 +1162,7 @@ class GaussianModelsOutput:
     x_repa: Optional[torch.Tensor] = None
     internal_representations: Optional[torch.Tensor] = None
     residual_codes: Optional[torch.Tensor] = None
-    vae_output: Optional[VAEOutput] = None
+    vae_output: Optional = None
 
 
 @dataclass
@@ -1366,35 +1271,6 @@ class GaussianHeadLRM(nn.Module):
         if self._config.use_dpr_lighting:
             self._dpr.cuda()
         return super().cuda(device)
-
-    # def state_dict(self, *args, destination=None, prefix="", keep_vars=False):
-    #     state_dict = super().state_dict(*args, destination=destination, prefix=prefix, keep_vars=keep_vars)
-    #     state_dict = {k: v for k, v in state_dict.items() if '_dpr' not in k}  # Exclude purely pretrained DPR module from state dict
-    #     return state_dict
-    #
-    # def load_state_dict(self, state_dict: Mapping[str, Any], strict: bool = True, assign: bool = False):
-    #     for k, p in self.named_parameters():
-    #         if k.startswith('_dpr'):
-    #             state_dict[k] = p
-    #
-    #     for prefix, module in self.named_modules():
-    #         if prefix.startswith('_dpr'):
-    #             for k, p in module._buffers.items():
-    #                 if k not in module._non_persistent_buffers_set:
-    #                     state_dict[f"{prefix}.{k}"] = p
-    #
-    #         # def recurse_buffers(module: nn.Module, prefix: str = ''):
-    #         #     for k, p in module._buffers.items():
-    #         #         state_dict[f"{prefix}.{k}"] = p
-    #         #
-    #         #     for k, child_module in module.named_modules():
-    #         #         recurse_buffers(child_module, prefix=f"{prefix}.{k}")
-    #         #
-    #         # recurse_buffers(self._dpr, prefix='_dpr')
-    #
-    #
-    #
-    #     return super().load_state_dict(state_dict, strict, assign)
 
     @property
     def device(self):
@@ -1828,592 +1704,61 @@ class GaussianHeadLRM(nn.Module):
         return output
 
 
-@dataclass
-class DenoisingGaussianHeadLRMConfig(Config):
-    head_lrm: GaussianHeadLRMConfig
-    predict_x0: bool = False
-    predict_eps_derived_from_x0: bool = False
-    learn_sigma: bool = True
-    sigma_small: bool = False
-
-
-@dataclass
-class DenoisingGaussianHeadLRMOutput:
-    gaussian_models: List[List[GaussianModel]]  # [B, VO/1]
-    diffusion_output: torch.Tensor  # [B, VO, C, H, W]
-    nv_output: Optional[torch.Tensor] = None  # [B, VNV, C, H, W]
-    x_repa: Optional[torch.Tensor] = None
-    internal_representations: Optional[torch.Tensor] = None
-
-
-class DenoisingGaussianHeadLRM(nn.Module):
-    def __init__(self, config: DenoisingGaussianHeadLRMConfig):
-        super().__init__()
-        self._t_embedder = TimestepEmbedder(config.head_lrm.head_transformer.transformer.d_hidden)
-
-        if not config.learn_sigma or config.head_lrm.gaussian_decoder.use_variance_channels:
-            head_lrm_config = config.head_lrm
-        else:
-            # We need to predict mean and variance => simply double output channels
-            gaussian_decoder_config = replace(config.head_lrm.gaussian_decoder, n_channels_color=2 * config.head_lrm.gaussian_decoder.n_channels_color)
-            head_lrm_config = replace(config.head_lrm, gaussian_decoder=gaussian_decoder_config)
-
-        self._lifting_module = GaussianHeadLRM(head_lrm_config)
-
-        self.reset_cache()
-        self.initialize_weights()
-
-    def initialize_weights(self):
-        # Initialize timestep embedding MLP:
-        nn.init.normal_(self._t_embedder.mlp[0].weight, std=0.02)
-        nn.init.normal_(self._t_embedder.mlp[2].weight, std=0.02)
-
-    def forward(self, x, t, batch: GaussianHeadLRMBatch, cached_internal_representations: Optional[torch.Tensor] = None) -> DenoisingGaussianHeadLRMOutput:
-        t_all = torch.zeros((batch.B, batch.VI), device=batch.device, dtype=t.dtype)
-        t_flat = t.flatten(0, 1) if len(t.shape) == 2 else t
-        t_all[batch.input_view_mask == InputType.NOISY] = t_flat
-
-        t_all = self._t_embedder(t_all)
-        x_t = batch.input_images.clone()
-        x_t[batch.input_view_mask == InputType.NOISY] = x.flatten(0, 1)
-        batch.input_images = x_t  # TODO: Is it ok, to overwrite here?
-
-        output = self._lifting_module.forward(batch, condition=t_all, cached_internal_representations=cached_internal_representations)
-
-        if batch.render_view_mask is not None:
-            diffusion_output = output.rendering_output.rendered_images[batch.render_view_mask == RenderType.DIFFUSION].unflatten(0, (batch.B, -1))
-            nv_output = output.rendering_output.rendered_images[batch.render_view_mask == RenderType.NV].unflatten(0, (batch.B, -1))
-        else:
-            diffusion_output = output.rendering_output.rendered_images
-            nv_output = None
-
-        output = DenoisingGaussianHeadLRMOutput(
-            gaussian_models=output.gaussian_models_output.gaussian_models,
-            diffusion_output=diffusion_output,
-            nv_output=nv_output,
-            x_repa=output.gaussian_models_output.x_repa,
-            internal_representations=output.gaussian_models_output.internal_representations
-        )
-
-        return output
-
-    def set_cache_trajectory(self, poses: List[Pose], intrinsics: Intrinsics):
-        self._cache_poses = poses
-        self._cache_intrinsics = intrinsics
-
-    def set_condition_images(self, condition_images: torch.Tensor):
-        self._condition_images = condition_images
-
-    def set_denoising_cameras(self, denoising_poses: List[Pose], denoising_intrinsics: List[Intrinsics]):
-        self._denoising_poses = denoising_poses
-        self._denoising_intrinsics = denoising_intrinsics
-
-    def set_denoising_expression_codes(self, expression_codes: List[torch.Tensor]):
-        self._denoising_expression_codes = expression_codes
-
-    def render(self, gaussian_models: List[GaussianModel], batch: GaussianHeadLRMBatch) -> RenderingOutput:
-        return self._lifting_module.render(gaussian_models, batch)
-
-    def forward_and_cache(self, x, t, batch: GaussianHeadLRMBatch):
-        t_all = torch.zeros((batch.B, batch.VI), device=batch.device, dtype=t.dtype)
-        t_flat = t.flatten(0, 1) if len(t.shape) == 2 else t
-        t_all[batch.input_view_mask == InputType.NOISY] = t_flat
-
-        t_all = self._t_embedder(t_all)
-        x_t = batch.input_images.clone()
-        x_t[batch.input_view_mask == InputType.NOISY] = x.flatten(0, 1)
-        batch.input_images = x_t  # TODO: Is it ok, to overwrite here?
-
-        if len(self._denoising_poses) > 0:
-            pose = self._denoising_poses.pop(0)
-            intrinsics = self._denoising_intrinsics.pop(0)
-            render_cam2worlds = [[pose] for _ in range(len(batch.input_images))]
-            render_intrinsics = [[intrinsics] for _ in range(len(batch.input_images))]
-            batch.render_intrinsics = [[intr.rescale(x.shape[-1], x.shape[-2], inplace=False) for intr in intrinsics] for intrinsics in render_intrinsics]
-            batch.render_cam2world_poses = render_cam2worlds
-            input_cam2worlds = [render_cam2world + input_cam2world[len(render_cam2world):] for render_cam2world, input_cam2world in
-                                zip(render_cam2worlds, batch.input_cam2worlds)]
-            input_intrinsics = [render_intr + input_intr[len(render_intr):] for render_intr, input_intr in zip(render_intrinsics, batch.input_intrinsics)]
-        else:
-            input_cam2worlds = batch.input_cam2worlds
-            input_intrinsics = batch.input_intrinsics
-
-        if len(self._denoising_expression_codes) > 0:
-            expression_code = self._denoising_expression_codes.pop(0)
-            expression_codes = torch.stack([expression_code for _ in range(len(batch.input_images))])
-            batch.expression_codes = expression_codes
-
-        gaussian_models_output = self._lifting_module.create_gaussian_models(batch.input_images,
-                                                                             features=batch.features,
-                                                                             input_cam2worlds=input_cam2worlds,
-                                                                             input_intrinsics=input_intrinsics,
-                                                                             condition=t_all,
-                                                                             input_view_mask=batch.input_view_mask,
-                                                                             expression_codes=batch.expression_codes)
-        gaussian_models = gaussian_models_output.gaussian_models
-        rendered_images = self._lifting_module.render(gaussian_models, batch).rendered_images
-
-        if self._condition_images is not None:
-            B, _, _, H, W = batch.input_images.shape
-            rendered_images = torch.cat([self._condition_images[:, :, :, :, :int(W / 2)], rendered_images[:, :, :, :, int(W / 2):]], dim=4)
-
-        self._cached_gaussian_models = gaussian_models
-        self._cached_internal_representations = gaussian_models_output.internal_representations
-        self._denoising_history.append((x.detach().cpu() * 255).clamp(0, 255).to(torch.uint8))
-        self._prediction_history.append((rendered_images.detach().cpu() * 255).clamp(0, 255).to(torch.uint8))
-
-        if len(self._cache_poses) > 0:
-            pose = self._cache_poses.pop(0)
-            pose = [[pose] for _ in range(len(batch.input_images))]
-            intrinsics = [[self._cache_intrinsics] for _ in range(len(batch.input_images))]
-            render_resolution = [Dimensions(512, 512) for _ in range(len(batch.input_images))]
-            batch_cache_trajectory = replace(batch, render_cam2world_poses=pose, render_intrinsics=intrinsics, render_resolution=render_resolution)
-            rendered_images_cache = self._lifting_module.render(gaussian_models, batch_cache_trajectory).rendered_images
-            self._cache_trajectory.append((rendered_images_cache[:, 0].detach().cpu() * 255).clamp(0, 255).to(torch.uint8))
-
-        output = DenoisingGaussianHeadLRMOutput(
-            gaussian_models=gaussian_models,
-            diffusion_output=rendered_images,
-        )
-
-        return output
-
-    def reset_cache(self):
-        self._denoising_history = []
-        self._prediction_history = []
-        self._cache_trajectory = []
-        self._cache_poses = []
-        self._cache_intrinsics = None
-        self._condition_images = None
-        self._denoising_poses = []
-        self._denoising_intrinsics = []
-        self._denoising_expression_codes = []
-        self._cached_internal_representations = None
-
-
-class DenoisingDiT(DiT):
-    def forward(self, x, t, batch: GaussianHeadLRMBatch, cached_internal_representations: Optional[torch.Tensor] = None) -> DenoisingGaussianHeadLRMOutput:
-        diffusion_output = super().forward(x[:, 0], t[:, 0], y=torch.tensor([0], device=x.device))
-
-        output = DenoisingGaussianHeadLRMOutput(
-            gaussian_models=None,
-            diffusion_output=diffusion_output[:, None],
-            nv_output=None,
-            x_repa=None,
-            internal_representations=None
-        )
-
-        return output
-
-    @classmethod
-    def from_dit(cls, dit: DiT):
-        denoising_dit = cls()
-        denoising_dit.__dict__ = dit.__dict__
-        return denoising_dit
-
-
-@dataclass
-class HeadLVSMConfig(Config):
-    in_channels: int
-    patch_size: int
-    n_layers_encoder: int
-    n_layers: int
-    transformer: TransformerConfig
-    n_color_channels: int = 3
-    n_mlp_layers: int = 2
-    use_adaptive_layer_norm: bool = False
-    init_adaptive_layer_norm_identity: bool = False
-    use_repa: bool = False
-    repa_layer: int = -1
-    d_repa_target: int = 768
-    use_bfloat16: bool = False
-    cross_attention_type: CrossAttentionType = CrossAttentionType.Q2K
-    use_camera_transformer: bool = False
-    use_positional_embedding_render: bool = True
-    n_registers: int = 0
-    n_registers_render: int = 0
-    use_separate_renderer: bool = False  # Only relevant for diffusion training: separate renderers for decoding noise/x0 from internal representation
-    use_plucker: bool = False
-    use_lam_transformer: bool = False
-    d_expression_codes: Optional[int] = None
-    n_expression_tokens: Optional[int] = 4
-    target_views_are_noise: bool = False  # If true, this is a multi-view image diffusion setting where the target views are the noisy input views
-    use_vae: bool = False
-
-
-@dataclass
-class DenoisingHeadLVSMConfig(Config):
-    head_lvsm: HeadLVSMConfig
-    predict_x0: bool = False
-    predict_eps_derived_from_x0: bool = False
-    learn_sigma: bool = True
-    sigma_small: bool = False
-
-
-class HeadLVSM(nn.Module):
-    def __init__(self, config: HeadLVSMConfig):
-        super().__init__()
-        self._config = config
-
-        self._conv_patchify = nn.Conv2d(in_channels=config.in_channels + 6 if config.use_plucker or config.target_views_are_noise else config.in_channels,
-                                        out_channels=config.transformer.d_hidden,
-                                        kernel_size=config.patch_size,
-                                        stride=config.patch_size,
-                                        bias=False)
-
-        self._conv_patchify_target = nn.Conv2d(in_channels=6, out_channels=config.transformer.d_hidden,
-                                               kernel_size=config.patch_size,
-                                               stride=config.patch_size,
-                                               bias=False)
-
-        gpt_config = GPTConfig(
-            block_size=(512 // config.patch_size) ** 2,  # TODO: Here we assume input images will be 512x512 resolution
-            n_layer=config.n_layers_encoder,
-            n_head=config.transformer.n_heads,
-            n_embd=config.transformer.d_hidden,
-            use_adaptive_layer_norm=config.use_adaptive_layer_norm,
-            init_adaptive_layer_norm_identity=config.init_adaptive_layer_norm_identity,
-            use_repa=config.use_repa,
-            repa_layer=config.repa_layer,
-            d_repa_target=config.d_repa_target,
-            n_registers=config.n_registers,
-            use_causal_attention=config.transformer.use_causal_attention,
-        )
-        self._transformer_encoder = GPT(gpt_config)
-
-        if config.use_lam_transformer:
-            self._transformer_render = TransformerDecoder('sd3_cond', config.transformer.n_layers, config.transformer.n_heads,
-                                                          config.transformer.d_hidden,
-                                                          cond_dim=config.transformer.d_hidden,
-                                                          use_ada_ln=config.use_adaptive_layer_norm,
-                                                          transform_keys=False)
-
-            if config.d_expression_codes is not None:
-                self._expression_mlp = MLP(config.d_expression_codes,
-                                           [256] * 2 + [
-                                               config.transformer.d_hidden if config.n_expression_tokens is None else config.transformer.d_hidden * config.n_expression_tokens],
-                                           activation_layer=torch.nn.ReLU)
-
-                self._expression_transformer = TransformerDecoder('sd3_cond',
-                                                                  config.transformer.n_layers, config.transformer.n_heads, config.transformer.d_hidden,
-                                                                  cond_dim=config.transformer.d_hidden,
-                                                                  use_ada_ln=config.use_adaptive_layer_norm,
-                                                                  transform_keys=False)
-        else:
-            gpt_config_2 = replace(gpt_config,
-                                   n_layer=config.n_layers,
-                                   use_repa=False
-                                   )
-            # self._transformer = GPT(gpt_config_2)
-
-            gpt_config_render = replace(gpt_config_2,
-                                        block_size=(512 // config.patch_size) ** 2 + (512 // config.patch_size) * (
-                                                744 // config.patch_size) * 6,  # 1 input + 1 render view
-                                        use_positional_embedding=config.use_positional_embedding_render,
-                                        use_cross_attention=config.cross_attention_type != CrossAttentionType.QK2QK,
-                                        n_registers=config.n_registers_render,
-                                        )
-
-            self._transformer_render = GPT(gpt_config_render)
-
-        if config.use_separate_renderer and not config.target_views_are_noise:
-            self._transformer_render_separate = GPT(gpt_config_render)
-
-        if config.use_camera_transformer:
-            gpt_config_camera = replace(gpt_config,
-                                        use_repa=False,
-                                        use_positional_embedding=config.use_positional_embedding_render,
-                                        n_registers=config.n_registers_render, )
-            self._transformer_camera = GPT(gpt_config_camera)
-
-        self._pixel_shuffle = PixelShuffle(config.patch_size)
-        mlp_d_in = config.transformer.d_hidden // (config.patch_size ** 2)
-        self._mlp_decoder = MLP(mlp_d_in, [config.transformer.d_hidden] * (config.n_mlp_layers - 1) + [config.n_color_channels],
-                                activation_layer=GELU)
-
-        if config.use_vae:
-            self._out_activation = nn.Identity()
-        else:
-            self._out_activation = nn.Sigmoid()
-
-        # if not config.learn_sigma or config.head_lrm.gaussian_decoder.use_variance_channels:
-        #     head_lrm_config = config.head_lrm
-        # else:
-        #     # We need to predict mean and variance => simply double output channels
-        #     gaussian_decoder_config = replace(config.head_lrm.gaussian_decoder, n_channels_color=2 * config.head_lrm.gaussian_decoder.n_channels_color)
-        #     head_lrm_config = replace(config.head_lrm, gaussian_decoder=gaussian_decoder_config)
-        #
-        # self._lifting_module = GaussianHeadLRM(head_lrm_config)
-
-        # self.reset_cache()
-
-    def forward(self, batch: GaussianHeadLRMBatch, condition: Optional[torch.Tensor] = None,
-                return_internal_representations: bool = False, return_repa: bool = False):
-        with torch.autocast(device_type='cuda', dtype=torch.bfloat16,
-                            enabled=self._config.use_bfloat16):
-
-            x, x_repa = self.create_internal_representations(batch.input_images,
-                                                             input_cam2worlds=batch.input_cam2worlds, input_intrinsics=batch.input_intrinsics,
-                                                             condition=condition, return_repa=True)
-
-            # target_tokens = x[:, B:]
-            # x = x[:, :B]
-
-            T_input = x.shape[0]
-            # x = torch.cat([x, target_tokens], dim=0)  # Now put camera embeddings into token dimension --> dense self-attention
-
-            # TODO: cross-view transformer not needed for now
-            # x = self._transformer(x, condition=t)
-            # target_features = x[T_input:]  # [HW, B, C]
-
-            output_rgb = self.render(x, batch, t=condition).rendered_images
-
-        if self._config.use_bfloat16:
-            x = x.to(torch.float32)
-            output_rgb = output_rgb.to(torch.float32)
-            if x_repa is not None:
-                x_repa = x_repa.to(torch.float32)
-
-        if return_repa:
-            if return_internal_representations:
-                return output_rgb, x_repa, x
-            else:
-                return output_rgb, x_repa
-        else:
-            if return_internal_representations:
-                return output_rgb, x
-            else:
-                return output_rgb
-
-    def create_internal_representations(self,
-                                        input_images: torch.Tensor,
-                                        input_cam2worlds: List[List[Pose]] = None,
-                                        input_intrinsics: List[List[Intrinsics]] = None,
-                                        condition: Optional[torch.Tensor] = None,
-                                        return_repa: bool = False):
-        with torch.autocast(device_type='cuda', dtype=torch.bfloat16,
-                            enabled=self._config.use_bfloat16):
-
-            B, V, _, H, W = input_images.shape
-
-            # TODO: input plucker
-
-            x = input_images
-
-            if self._config.use_plucker:
-                input_plucker_embeddings = plucker_embedder(input_cam2worlds, input_intrinsics, H, W, x.device, offset=False)
-                x = torch.cat([x, input_plucker_embeddings], dim=2)
-
-            x = x.flatten(0, 1)
-
-            # Use conv to patchify images into image tokens
-            x = self._conv_patchify(x)  # [B*V, D, H_p, W_p]
-
-            # encode image tokens
-            x = rearrange(x, 'bv c h w -> (h w) bv c')
-            if condition is not None:
-                condition = rearrange(condition, 'b v c -> (b v) c')
-
-            x_repa = None
-            if self._config.use_repa:
-                # x, x_repa = self._transformer_encoder(x, condition=t.repeat((2, 1)))  # TODO: Currently, we feed target plucker through transformer encoder and have to repeat timestep embedding
-                # x_repa = x_repa[:B]
-                x, x_repa = self._transformer_encoder(x, condition=condition)
-
-                if x_repa is not None:
-                    x_repa = rearrange(x_repa, '(b v) hw c -> b (v hw) c', b=B, v=V)
-            else:
-                x = self._transformer_encoder(x, condition=condition)
-
-            if return_repa:
-                return x, x_repa
-            else:
-                return x
-
-    def render(self,
-               internal_representations: torch.Tensor,
-               batch: GaussianHeadLRMBatch,
-               t: Optional[torch.Tensor] = None,
-               use_separate_renderer: bool = False) -> RenderingOutput:
-        with torch.autocast(device_type='cuda', dtype=torch.bfloat16,
-                            enabled=self._config.use_bfloat16):
-
-            B, V, _, _, _ = batch.input_images.shape
-            device = internal_representations.device
-
-            VT = len(batch.render_cam2world_poses[0])
-
-            H_p = int(sqrt(internal_representations.shape[0]))
-            W_p = H_p
-
-            if self._config.target_views_are_noise:
-                internal_representations = rearrange(internal_representations, 'hw (b v) c -> b v hw c', b=B, v=V)
-                target_tokens = internal_representations[batch.input_view_mask == InputType.NOISY]
-                internal_representations = internal_representations[
-                    batch.input_view_mask == InputType.CLEAN]  # TODO: Have a flag for this? This only works in the conditional case now
-                target_tokens = rearrange(target_tokens, 'bvt hw c -> hw bvt c')
-                # internal_representations = rearrange(internal_representations, 'bvc hw c -> hw bvc c')
-                internal_representations = rearrange(internal_representations, '(b vc) hw c -> (vc hw) b c', b=B)
-
-            else:
-                W, H = batch.render_resolution[0]
-                render_intrinsics = [[intr.rescale(1 / W, 1 / H, inplace=False) for intr in intr_list] for intr_list in batch.render_intrinsics]
-                target_camera_feature = plucker_embedder(batch.render_cam2world_poses, render_intrinsics, H, W, device)
-                target_tokens = self._conv_patchify_target(target_camera_feature.flatten(0, 1))
-                _, D, H_p, W_p = target_tokens.shape
-                target_tokens = target_tokens.flatten(2, 3).permute(2, 0, 1)
-
-            if self._config.use_camera_transformer:
-                camera_condition = None if t is None else t.repeat_interleave(VT, dim=0)
-                target_tokens = self._transformer_camera(target_tokens, condition=camera_condition)
-
-            T_input = internal_representations.shape[0]
-
-            if self._config.use_separate_renderer and use_separate_renderer:
-                transformer_render = self._transformer_render_separate
-            else:
-                transformer_render = self._transformer_render
-
-            if self._config.cross_attention_type == CrossAttentionType.Q2K:
-                # TODO: This is handling each target view separately. Maybe we do not want to do that
-                hw = target_tokens.shape[0]
-                target_tokens = rearrange(target_tokens, 'hw (b v) c -> (v hw) b c', b=B)
-                x = transformer_render(target_tokens, keys=internal_representations, condition=t)
-                x = rearrange(x, '(v hw) b c -> hw (b v) c', hw=hw)
-            elif self._config.cross_attention_type == CrossAttentionType.Q2QK:
-                internal_representations = internal_representations.repeat_interleave(VT, dim=1)  # Copy internal representation for each target view
-                qk = torch.cat([target_tokens, internal_representations], dim=0)
-                x = transformer_render(target_tokens, keys=qk, condition=t)
-            elif self._config.cross_attention_type == CrossAttentionType.QK2QK:
-                internal_representations = internal_representations.repeat_interleave(VT, dim=1)  # Copy internal representation for each target view
-                qk = torch.cat([target_tokens, internal_representations], dim=0)
-                x = transformer_render(qk, condition=t)
-                x = x[:len(target_tokens)]
-
-            if self._config.d_expression_codes is not None:
-                expression_codes = batch.expression_codes
-                # if self._config.target_views_are_noise:
-                #     expression_codes = expression_codes[batch.input_view_mask == InputType.NOISY][:, None]  # TODO: Implicitly we are assuming here that there is only one expression per batch?
-
-                B = x.shape[1]
-                if self._config.n_expression_tokens is None:
-                    expression_tokens = self._expression_mlp(expression_codes).flatten(0, 1)
-                else:
-                    expression_tokens = self._expression_mlp(expression_codes).reshape(B * expression_codes.shape[1],
-                                                                                       self._config.n_expression_tokens,
-                                                                                       self._config.transformer.d_hidden)
-                expression_tokens = expression_tokens.permute(1, 0, 2)
-
-                internal_representation = x
-                # Duplicate internal 3D representation for each expression code -> there will be separate GaussianModels for each expression code
-                x = x.repeat_interleave(expression_codes.shape[1], dim=1)
-                if t is not None:
-                    condition = t.repeat_interleave(expression_codes.shape[1], dim=0)
-                x = self._expression_transformer(x, keys=expression_tokens, condition=condition)
-
-            target_features = x
-
-            # x = torch.cat([internal_representations, target_tokens], dim=0)  # Now put camera embeddings into token dimension --> dense self-attention
-            # x = self._transformer_render(x, condition=t.repeat_interleave(VT, dim=0))
-            # target_features = x[T_input:]  # [HW, BV, C]
-
-            # Upsampling
-            output = rearrange(target_features, '(h w) (b v) d -> b v d h w', b=B, h=H_p, w=W_p)
-            # output = target_features.reshape(H_p, W_p, B, VT, D).permute(2, 3, 4, 0, 1)  # [B, V, C, H, W]
-            output = self._pixel_shuffle(output)
-            output_rgb = self._mlp_decoder(output.permute(0, 1, 3, 4, 2)).permute(0, 1, 4, 2, 3)
-            output_rgb = self._out_activation(output_rgb)
-
-        if self._config.use_bfloat16:
-            output_rgb = output_rgb.to(torch.float32)
-
-        # output_rgb = output_rgb.permute(0, 3, 1, 2)  # [B, 3, H, W]
-
-        output = RenderingOutput(output_rgb)
-
-        return output
-
-
-class DenoisingHeadLVSM(nn.Module):
-
-    def __init__(self, config: DenoisingHeadLVSMConfig):
-        super().__init__()
-        self._t_embedder = TimestepEmbedder(config.head_lvsm.transformer.d_hidden)
-
-        self._lifting_module = HeadLVSM(config.head_lvsm)
-
-        self.reset_cache()
-        self.initialize_weights()
-        self._config = config
-
-    def initialize_weights(self):
-        # Initialize timestep embedding MLP:
-        nn.init.normal_(self._t_embedder.mlp[0].weight, std=0.02)
-        nn.init.normal_(self._t_embedder.mlp[2].weight, std=0.02)
-
-    def forward(self, x, t, batch: GaussianHeadLRMBatch):
-        t_all = torch.zeros((batch.B, batch.VI), device=batch.device, dtype=t.dtype)
-        t_flat = t.flatten(0, 1) if len(t.shape) == 2 else t
-        t_all[batch.input_view_mask == InputType.NOISY] = t_flat
-
-        t_all = self._t_embedder(t_all)
-        x_t = batch.input_images.clone()
-        x_t[batch.input_view_mask == InputType.NOISY] = x.flatten(0, 1)
-        batch.input_images = x_t  # TODO: Is it ok, to overwrite here?
-
-        output, x_repa, internal_representations = self._lifting_module.forward(batch, condition=t_all, return_internal_representations=True, return_repa=True)
-
-        output = DenoisingGaussianHeadLRMOutput(
-            gaussian_models=internal_representations,
-            diffusion_output=output,
-            x_repa=x_repa
-        )
-
-        return output
-
-    def forward_and_cache(self, x, t, batch: GaussianHeadLRMBatch):
-        t_all = torch.zeros((batch.B, batch.VI), device=batch.device, dtype=t.dtype)
-        t_flat = t.flatten(0, 1) if len(t.shape) == 2 else t
-        t_all[batch.input_view_mask == InputType.NOISY] = t_flat
-
-        t_all = self._t_embedder(t_all)
-        x_t = batch.input_images.clone()
-        x_t[batch.input_view_mask == InputType.NOISY] = x.flatten(0, 1)
-        batch.input_images = x_t  # TODO: Is it ok, to overwrite here?
-
-        internal_representations = self._lifting_module.create_internal_representations(batch.input_images,
-                                                                                        input_cam2worlds=batch.input_cam2worlds,
-                                                                                        input_intrinsics=batch.input_intrinsics,
-                                                                                        condition=t_all)
-        rendered_images = self._lifting_module.render(internal_representations, batch, t=t_all).rendered_images
-
-        self._cached_gaussian_models = internal_representations.permute(1, 0, 2)  # [B, T, D]
-        if self._config.head_lvsm.use_vae:
-            # Do not cast to uint8, because images are in VAE latent space (and small enough anyways, so no storage issues)
-            self._denoising_history.append((x.detach().cpu() * 255))
-            self._prediction_history.append((rendered_images.detach().cpu() * 255))
-        else:
-            self._denoising_history.append((x.detach().cpu() * 255).clamp(0, 255).to(torch.uint8))
-            self._prediction_history.append((rendered_images.detach().cpu() * 255).clamp(0, 255).to(torch.uint8))
-
-        output = DenoisingGaussianHeadLRMOutput(
-            gaussian_models=internal_representations,
-            diffusion_output=rendered_images,
-        )
-
-        return output
-
-    def render(self,
-               internal_representations: torch.Tensor,
-               batch: GaussianHeadLRMBatch,
-               t: Optional[torch.Tensor] = None,
-               use_separate_renderer: bool = False) -> RenderingOutput:
-        t = self._t_embedder(t)
-
-        output = self._lifting_module.render(internal_representations, batch, t, use_separate_renderer)
-
-        return output
-
-    def reset_cache(self):
-        self._denoising_history = []
-        self._prediction_history = []
+if __name__ == '__main__':
+    from elias.util.io import load_json
+    from flexavatar.data_adapter.in_the_wild_data_adapter import InTheWildDataAdapter
+    from flexavatar.config.dataset_config import SampleMetadata
+    from visage.matting.modnet import MODNetMatter
+
+    data_adapter = InTheWildDataAdapter("tobi")
+    sample_metadata = SampleMetadata("tobi", None, 0, None)
+    image = data_adapter.load_image(sample_metadata)
+
+    canonical_flame_to_world, _ = data_adapter.load_head_pose(sample_metadata)
+    cam2world_pose, intrinsics = data_adapter.load_camera_params(sample_metadata)
+
+    flame2world_pose = Pose(
+        canonical_flame_to_world.invert().numpy() @ cam2world_pose,
+        pose_type=PoseType.CAM_2_WORLD)
+
+    device = torch.device('cuda')
+    image_torch = torch.tensor(image / 255, dtype=torch.float32).permute(2, 0, 1)[None]
+    modnet_matter = MODNetMatter()
+    with torch.no_grad():
+        alpha_maps = modnet_matter.parse(image_torch).cpu()
+    image_torch = image_torch * alpha_maps[:, None] + 1 - alpha_maps[:, None]
+
+    expression_code = torch.zeros((1, 1, 135))
+    expression_code[:, :, :126] = torch.tensor(data_adapter.load_expression_code(sample_metadata))
+    batch = GaussianHeadLRMBatch(image_torch[:, None], None, [[flame2world_pose]], [[intrinsics.rescale(1 / 512, inplace=False)]], None, None, None, None, None, None,
+                                 expression_codes=expression_code,
+                                 dataset_ids=torch.ones((1, 1), dtype=torch.long))
+    batch = batch.to(device)
+
+    model_folder = "D:/Projects/PhD-7_Photoreal_3DMM/code_release/models/SLRM-1522"
+    dataset_config = MVDatasetConfig.from_json(load_json(f"{model_folder}/dataset_config.json"))
+
+    preprocessor = GaussianHeadLRMPreprocessor(dataset_config)
+    batch = preprocessor.process(batch)
+
+    model_config = GaussianHeadLRMConfig.from_json(load_json(f"{model_folder}/model_config.json"))
+    model_config.use_bfloat16 = False
+    model = GaussianHeadLRM(model_config)
+
+    checkpoint = torch.load(f"{model_folder}/checkpoints/ckpt-1050k.pt")
+    model.load_state_dict(checkpoint)
+    model.to(device)
+    with torch.no_grad():
+        output = model.create_gaussian_models(batch.input_images,
+                                              batch.features,
+                                              batch.input_cam2worlds,
+                                              batch.input_intrinsics,
+                                              expression_codes=batch.expression_codes,
+                                              dataset_ids=batch.dataset_ids)
+
+        resolution = 512
+        render_cam = pose_to_rendercam(flame2world_pose, intrinsics, resolution, resolution)
+        rendering_output = render_distwar(render_cam, output.gaussian_models[0][0], PipelineParams2(), torch.ones((3,), device=device))
+        rendered_image = rendering_output['render'].permute(1, 2, 0).detach().cpu().numpy()
+
+    print('hi')

@@ -22,10 +22,14 @@ dependencies:
   - libcusolver-dev
 
   - pip:
-      - dreifus
-      - --extra-index-url https://download.pytorch.org/whl/cu118
+      - --index-url https://download.pytorch.org/whl/cu118
       - torch
+      - dreifus
+      - elias
+      - visage
       - torchvision
       - einops
       - git+https://github.com/tobias-kirschstein/stylegan-generators.git
       - gaussian_splatting@git+https://github.com/tobias-kirschstein/gaussian-splatting.git
+      - modnet@git+https://github.com/tobias-kirschstein/MODNet.git
+      - diffusers
