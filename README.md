@@ -9,6 +9,8 @@ From the paper *"FlexAvatar: Learning Complete 3D Head Avatars with Partial Supe
 **CVPR 2026**
 
 ## 1. Setup
+
+### 1.1. Quick Setup (only example inference)
 1. Create conda environment `flexavatar` with newest PyTorch and CUDA 11.8:
     ```shell
     conda env create -f environment.yml
@@ -19,6 +21,19 @@ From the paper *"FlexAvatar: Learning Complete 3D Head Avatars with Partial Supe
     pip install -e .
     ```
 3. Download the pre-trained `FlexAvatar` model weights file from [https://nextcloud.tobias-kirschstein.de/index.php/s/X29kqKNndpSAKfB](https://nextcloud.tobias-kirschstein.de/index.php/s/X29kqKNndpSAKfB) and put it into `models/FLEX-1/checkpoints/ckpt-900k.pt`.
+
+### 1.2. Full Setup
+
+4. Install [Pixel3DMM](https://simongiebenhain.github.io/pixel3dmm/). Due to the complexity of the original Pixel3DMM repository, we provide a packaged version here that you can install via
+   ```shell
+   pip install git+https://github.com/tobias-kirschstein/easy-pixel3dmm.git
+   pip install --extra-index-url https://miropsota.github.io/torch_packages_builder pytorch3d==0.7.9+pt2.7.1cu118
+   pip install --no-build-isolation git+https://github.com/NVlabs/nvdiffrast.git
+   ```
+   Once all dependencies for `Pixel3DMM` are installed, you need to run the setup script
+   ```shell
+   python -m pixel3dmm.scripts.install_preprocessing_pipeline
+   ```
 
 # 2. Usage 
 
@@ -32,7 +47,19 @@ The resulting renderings will be stored in the `renderings` folder in the reposi
 ![](static/rendering_marble_sculpture.gif)
 
 ## 2.2. Create Avatars for Custom Inputs
-*Coming soon...*
+
+Ensure you have run the full setup instructions following [section 1.2](#12-full-setup).
+
+ 1. Put any portrait image (.jpg/.png) into `data/inputs/itw`. For example `${source_person}.jpg`
+ 2. Run Pixel3DMM tracking via
+   ```shell
+   python scripts/track_pixel3dmm_itw.py ${source_person} 
+   ```
+   The resulting tracking output will be written into `data/pixel3dmm_processing/tracking/itw/${source_person}`.
+ 3. Now you can create and render your avatar as described in [section 2.1](#21-render--animate-example-avatars), e.g. via 
+   ```shell
+   python scripts/render_example.py --source_person ${source_person}
+   ```
 
 ## 2.3. Drive Avatars with Custom Videos
 *Coming soon...*

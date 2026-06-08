@@ -10,3 +10,6 @@ _pycache__
 *.egg-info
 /docs/build/
 dist
+
+data/avatar_codes
+models/FLEX-1/checkpoints

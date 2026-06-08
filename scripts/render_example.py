@@ -18,13 +18,15 @@ from flexavatar.data_adapter.nersemble_data_adapter import NeRSembleDataAdapter
 from flexavatar.env import FLEXAVATAR_RENDERINGS_PATH
 from flexavatar.model.flexavatar_preprocessor import FlexAvatarPreprocessor
 from flexavatar.model.inversion import FittingManager, FittingConfig
+from flexavatar.model_manager.avatar_code_manager import AvatarCodeManager
 from flexavatar.model_manager.flexavatar_model_manager import FlexAvatarModelManager
 
 
 def main(source_person: str = 'marble_sculpture',
          driving_sequence: str = 'EMO-1-shout+laugh',
          run_fitting: bool = True,
-         render_360: bool = False):
+         render_360: bool = False,
+         load_avatar_code: bool = False):
     """
 
     Parameters
@@ -39,6 +41,8 @@ def main(source_person: str = 'marble_sculpture',
         Whether to run the fitting stage of FlexAvatar.
     render_360:
         Whether to render a 360° circular trajectory or a frontal circular trajectory.
+    load_avatar_code:
+        Whether to load the avatar code for a previously generated avatar from data/avatar_codes/itw
     """
 
     model_name = 'FLEX-1'
@@ -125,7 +129,14 @@ def main(source_person: str = 'marble_sculpture',
     # ----------------------------------------------------------
     # Run fitting
     # ----------------------------------------------------------
-    if run_fitting:
+    avatar_code_manager = AvatarCodeManager()
+    if load_avatar_code:
+        if not avatar_code_manager.has_avatar_code(source_person):
+            print(f"No avatar code available for {source_person}")
+            exit()
+        avatar_code = avatar_code_manager.load_avatar_code(source_person)
+        avatar_code = avatar_code.to(device)
+    elif run_fitting:
         fitting_config = FittingConfig()
         fitting_manager = FittingManager(model, fitting_config)
         avatar_code, fitting_history, _ = fitting_manager.run_inversion(batch)
@@ -159,7 +170,16 @@ def main(source_person: str = 'marble_sculpture',
 
             frames.append(rendered_image)
 
-    output_path = f"{output_folder}/rendering_p{source_person}_dr{driving_sequence}.mp4"
+    if not load_avatar_code:
+        avatar_code_manager.save_avatar_code(avatar_code, source_person)
+
+    output_name = f"rendering_p{source_person}"
+    if driving_sequence != 'EMO-1-shout+laugh':
+        output_name += f"_dr{driving_sequence}"
+    if render_360:
+        output_name += f"_360"
+
+    output_path = f"{output_folder}/{output_name}.mp4"
     ensure_directory_exists_for_file(output_path)
     mediapy.write_video(output_path, frames, fps=24)
     print("DONE")
