@@ -9,16 +9,24 @@ from dreifus.matrix import Pose, Intrinsics
 from dreifus.vector import Vec3
 from elias.util import load_img
 from elias.util.io import resize_img
+from mediapy import VideoReader
 
 from flexavatar.config.dataset_config import SampleMetadata
 from flexavatar.data_adapter.pixel3dmm_data_adapter import Pixel3DMMDataAdapter
 from flexavatar.env import FLEXAVATAR_INPUTS_PATH, FLEXAVATAR_PIXEL3DMM_PROCESSING_PATH
+from flexavatar.util.video import VideoFrameLoader
 
 ITW_ENLARGE_FACTOR = 0.1
 
 class InTheWildDataAdapter(Pixel3DMMDataAdapter):
     def load_image(self, sample_metadata: SampleMetadata) -> np.ndarray:
-        image = load_img(self.get_image_path(sample_metadata.participant_id))[..., :3]
+        image_path = self.get_image_path(sample_metadata.participant_id)
+
+        if self.is_video():
+            video_reader = VideoFrameLoader(image_path)
+            image = video_reader.load_frame(sample_metadata.timestep)
+        else:
+            image = load_img(image_path)[..., :3]
         crop_params = np.load(self._get_crop_params_path())
         offset = int((crop_params[1] - crop_params[0]) * ITW_ENLARGE_FACTOR)
         # extend_bottom = max(0, offset - (image.shape[0] - crop_params[1] - 1))
@@ -63,7 +71,13 @@ class InTheWildDataAdapter(Pixel3DMMDataAdapter):
         else:
             pose, intrinsics = super().load_camera_params(sample_metadata)
 
-            image_height = Image.open(self.get_image_path(sample_metadata.participant_id)).size[1]
+            image_path = self.get_image_path(sample_metadata.participant_id)
+            if self.is_video():
+                video_loader = VideoFrameLoader(image_path)
+                dimensions = video_loader.get_dimensions()
+                image_height = dimensions.h
+            else:
+                image_height = Image.open(image_path).size[1]
             crop_params = np.load(self._get_crop_params_path())
 
             offset = int((crop_params[1] - crop_params[0]) * ITW_ENLARGE_FACTOR)
@@ -93,8 +107,18 @@ class InTheWildDataAdapter(Pixel3DMMDataAdapter):
     def list_cameras_eval(self, sample_metadata: SampleMetadata) -> List[Union[str, int]]:
         return ["0", "90", "180", "270"]
 
+    def is_video(self) -> bool:
+        image_path = self.get_image_path(self._video_key)
+        is_video = image_path.endswith('.mp4') and Path(image_path).exists()
+        return is_video
+
     def list_timesteps(self, sample_metadata: SampleMetadata = None) -> List[int]:
-        return [0]
+        if self.is_video():
+            video_reader = VideoFrameLoader(self.get_image_path(self._video_key))
+            timesteps = list(range(video_reader.get_n_frames()))
+            return timesteps
+        else:
+            return [0]
 
     def apply_color_correction(self, image: np.ndarray, camera: Union[str, int]) -> np.ndarray:
         return image
@@ -102,7 +126,9 @@ class InTheWildDataAdapter(Pixel3DMMDataAdapter):
     def get_image_path(self, image_name: str) -> str:
         image_path = f"{FLEXAVATAR_INPUTS_PATH}/itw/{image_name}.png"
         if not Path(image_path).exists():
-            image_path = f"{FLEXAVATAR_INPUTS_PATH}/itw/{image_name}.jpg"
+            image_path = f"{FLEXAVATAR_INPUTS_PATH}/itw/{image_name}.mp4"
+            if not Path(image_path).exists():
+                image_path = f"{FLEXAVATAR_INPUTS_PATH}/itw/{image_name}.jpg"
 
         return image_path
 

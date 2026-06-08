@@ -43,6 +43,12 @@ For these images, 3D head avatars can be created and rendered via:
 ```shell
 python scripts/render_example.py
 ```
+The script supports these parameters among others:
+ * `--source_person ${source_person}`: Which avatar to create (available ones are in `data/inputs/itw`)
+ * `--driving_sequence $seq`: Which video should be used to reenact the avatar. By default, you can choose driving videos from the NeRSemble dataset (available ones are in `data/pixel3dmm_processing/tracking/nersemble/240`). If `--use_itw_driver` is set, you can instead use your own tracked video to animate the avatar (see [section 2.2](#22-create-avatars-for-custom-inputs) for tracking)
+ * `--render_360`: Render a 360° trajectory instead of the default frontal circular trajectory
+ * `--help`: Display more options
+
 The resulting renderings will be stored in the `renderings` folder in the repository.
 ![](static/rendering_marble_sculpture.gif)
 
@@ -62,7 +68,17 @@ Ensure you have run the full setup instructions following [section 1.2](#12-full
    ```
 
 ## 2.3. Drive Avatars with Custom Videos
-*Coming soon...*
+Ensure you have run the full setup instructions following [section 1.2](#12-full-setup).
+
+1. Put any portrait video (.mp4) into `data/inputs/itw`. For example `${driving_video}.mp4`
+2. Run Pixel3DMM tracking via
+   ```shell
+   python scripts/track_pixel3dmm_itw.py ${driving_video} 
+   ```
+3. You can now use your tracked driving video to animate an avatar as described in [section 2.1](#21-render--animate-example-avatars), e.g. via
+   ```shell
+   python scripts/render_example.py --driving_sequence ${driving_video} --use_itw_driver
+   ```
 
 ## 2.4. Interactive Viewer
 

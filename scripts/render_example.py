@@ -26,7 +26,8 @@ def main(source_person: str = 'marble_sculpture',
          driving_sequence: str = 'EMO-1-shout+laugh',
          run_fitting: bool = True,
          render_360: bool = False,
-         load_avatar_code: bool = False):
+         load_avatar_code: bool = False,
+         use_itw_driver: bool = False):
     """
 
     Parameters
@@ -43,6 +44,9 @@ def main(source_person: str = 'marble_sculpture',
         Whether to render a 360° circular trajectory or a frontal circular trajectory.
     load_avatar_code:
         Whether to load the avatar code for a previously generated avatar from data/avatar_codes/itw
+    use_itw_driver:
+        If true, load driving expression codes from an in-the-wild tracked video.
+        In this case, the `driving_sequence` parameter indicates the video name of the driving video.
     """
 
     model_name = 'FLEX-1'
@@ -92,7 +96,7 @@ def main(source_person: str = 'marble_sculpture',
                             None,
                             None,
                             input_expression_codes=input_recordexpression_code,
-                            dataset_ids=torch.ones((1, 1), dtype=torch.long))
+                            dataset_ids=torch.ones((1, 1), dtype=torch.long)) # bias sink: 1 = 3D
     batch = batch.to(device)
 
     # 5. Compute DinoV2 features for input image
@@ -104,10 +108,14 @@ def main(source_person: str = 'marble_sculpture',
     # ----------------------------------------------------------
 
     # 1. Load expression codes from driving sequence
-    data_adapter_driver = NeRSembleDataAdapter(240, driving_sequence, expression_code_config=dataset_config.expression_code_config)
+    if use_itw_driver:
+        data_adapter_driver = InTheWildDataAdapter(driving_sequence, expression_code_config=dataset_config.expression_code_config)
+    else:
+        data_adapter_driver = NeRSembleDataAdapter(240, driving_sequence, expression_code_config=dataset_config.expression_code_config)
+
     timesteps = data_adapter_driver.list_timesteps()
     expression_codes = [
-        torch.tensor(data_adapter_driver.load_expression_code(SampleMetadata(source_person, None, timestep, None)), device=device)[None, None]
+        torch.tensor(data_adapter_driver.load_expression_code(SampleMetadata(None, None, timestep, None)), device=device)[None, None]
         for timestep in timesteps]
 
     # 2. Define camera trajectory for rendering (1 camera pose per expression code)
@@ -131,12 +139,14 @@ def main(source_person: str = 'marble_sculpture',
     # ----------------------------------------------------------
     avatar_code_manager = AvatarCodeManager()
     if load_avatar_code:
+        # Load pre-existing avatar code (skip fitting)
         if not avatar_code_manager.has_avatar_code(source_person):
             print(f"No avatar code available for {source_person}")
             exit()
         avatar_code = avatar_code_manager.load_avatar_code(source_person)
         avatar_code = avatar_code.to(device)
     elif run_fitting:
+        # Run fitting stage to refine avatar code from encoder
         fitting_config = FittingConfig()
         fitting_manager = FittingManager(model, fitting_config)
         avatar_code, fitting_history, _ = fitting_manager.run_inversion(batch)
@@ -144,6 +154,7 @@ def main(source_person: str = 'marble_sculpture',
         ensure_directory_exists_for_file(output_path)
         mediapy.write_video(output_path, fitting_history)
     else:
+        # No fitting, create raw feed-forward avatar
         avatar_code = None
 
     # ----------------------------------------------------------

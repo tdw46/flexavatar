@@ -1,5 +1,5 @@
 from pathlib import Path
-from shutil import rmtree
+from shutil import rmtree, copy
 from typing import Optional
 
 import tyro
@@ -26,10 +26,17 @@ def main(source_person: Optional[str] = None, /):
             data_adapter = InTheWildDataAdapter(image_name)
             image_path = data_adapter.get_image_path(image_name)
             pixel3dmm_image_folder = f"{FLEXAVATAR_PIXEL3DMM_PROCESSING_PATH}/processing/input/itw/{image_name}"
-            pixel3dmm_image_path = f"{pixel3dmm_image_folder}/{image_name}.jpg"
-            ensure_directory_exists_for_file(pixel3dmm_image_path)
-            image = load_img(image_path)
-            save_img(image[..., :3], pixel3dmm_image_path)
+            is_video = image_path.endswith(".mp4")
+
+            if is_video:
+                pixel3dmm_image_path = f"{pixel3dmm_image_folder}/{image_name}.mp4"
+                ensure_directory_exists_for_file(pixel3dmm_image_path)
+                copy(image_path, pixel3dmm_image_path)
+            else:
+                pixel3dmm_image_path = f"{pixel3dmm_image_folder}/{image_name}.jpg"
+                ensure_directory_exists_for_file(pixel3dmm_image_path)
+                image = load_img(image_path)
+                save_img(image[..., :3], pixel3dmm_image_path)
 
             run_pixel3dmm(pixel3dmm_image_path, f"{FLEXAVATAR_PIXEL3DMM_PROCESSING_PATH}/processing/itw", f"{FLEXAVATAR_PIXEL3DMM_PROCESSING_PATH}/tracking/itw", cleanup=True)
             if Path(pixel3dmm_image_folder).is_dir():
