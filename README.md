@@ -54,6 +54,7 @@ Additionally, the corresponding avatar code will be stored in `data/avatar_codes
 ![](static/rendering_marble_sculpture.gif)
 
 ## 2.2. Create Avatars for Custom Inputs
+![](static/flexavatar_script_demo.gif)
 
 Ensure you have run the full setup instructions following [section 1.2](#12-full-setup).
 

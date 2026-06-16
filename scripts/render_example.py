@@ -25,6 +25,7 @@ from flexavatar.model_manager.flexavatar_model_manager import FlexAvatarModelMan
 
 def main(source_person: str = 'marble_sculpture',
          driving_sequence: str = 'EMO-1-shout+laugh',
+         /,
          run_fitting: bool = True,
          render_360: bool = False,
          load_avatar_code: bool = False,
