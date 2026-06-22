@@ -106,6 +106,37 @@ For live-reenactment to work, make sure you have `SHeaP` installed:
 pip install git+https://github.com/tobias-kirschstein/sheap-3.9.git
 ```
 
+## 2.5. Web Studio
+
+The browser-based studio keeps the same guided flow as the interactive viewer:
+
+1. Pick an avatar image or load an existing avatar code.
+2. Generate the avatar with Pixel3DMM + FlexAvatar.
+3. Preview with the default driving video or manual expression sliders.
+4. Use browser webcam frames to drive the avatar last.
+
+Install the extra web dependencies once:
+```shell
+pip install -r requirements-web.txt
+cd web
+npm install
+```
+
+Start the Python runtime API:
+```shell
+python scripts/run_web.py
+```
+
+In another terminal, start the web UI:
+```shell
+cd web
+npm run dev
+```
+
+Then open [http://127.0.0.1:5173](http://127.0.0.1:5173).
+
+The web viewport streams CUDA-rendered FlexAvatar frames from Python for dynamic animation and can export the current avatar as a web-viewable Gaussian Splat PLY for the integrated Three.js splat viewer.
+
 <hr>
 
 If you find this repository useful please consider citing

@@ -7,7 +7,10 @@
 #
 
 import json
+import os
+import ssl
 import time
+import traceback
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from shutil import copy2, rmtree
@@ -15,6 +18,7 @@ from threading import Thread
 from typing import Literal, Optional
 
 import cv2
+import certifi
 import dearpygui.dearpygui as dpg
 import numpy as np
 import torch
@@ -43,6 +47,21 @@ from flexavatar.model_manager.avatar_code_manager import AvatarCodeManager
 from flexavatar.model_manager.flexavatar_model_manager import FlexAvatarModelManager
 from flexavatar.util.codes import interpolate_codes
 from flexavatar.viewer.viewer_utils import Mini3DViewerConfig, Mini3DViewer
+
+
+def configure_certifi_ssl():
+    os.environ.setdefault("SSL_CERT_FILE", certifi.where())
+    os.environ.setdefault("REQUESTS_CA_BUNDLE", certifi.where())
+
+    def create_certifi_context(*args, **kwargs):
+        if "cafile" not in kwargs:
+            kwargs["cafile"] = certifi.where()
+        return ssl.create_default_context(*args, **kwargs)
+
+    ssl._create_default_https_context = create_certifi_context
+
+
+configure_certifi_ssl()
 
 
 def transform_gaussian_model(gaussian_model: GaussianModel, rigid_transform: torch.Tensor):
@@ -75,14 +94,21 @@ def run_pixel3dmm(image_path: str):
                 image = load_img(source_path)
                 save_img(image[..., :3], pixel3dmm_image_path)
 
-            main_pixel3dmm(pixel3dmm_image_path,
-                           f"{FLEXAVATAR_PIXEL3DMM_PROCESSING_PATH}/processing/itw",
-                           f"{FLEXAVATAR_PIXEL3DMM_PROCESSING_PATH}/tracking/itw",
-                           cleanup=True)
+            try:
+                main_pixel3dmm(pixel3dmm_image_path,
+                               f"{FLEXAVATAR_PIXEL3DMM_PROCESSING_PATH}/processing/itw",
+                               f"{FLEXAVATAR_PIXEL3DMM_PROCESSING_PATH}/tracking/itw",
+                               cleanup=True)
+            except IndexError as e:
+                raise RuntimeError(
+                    "Pixel3DMM did not detect a supported face in this image. "
+                    "Try a front-facing photoreal portrait, or load an existing avatar code."
+                ) from e
             if Path(pixel3dmm_image_folder).is_dir():
                 rmtree(pixel3dmm_image_folder)
         except Exception as e:
             print(f"[ERROR] Skipping {image_name}")
+            traceback.print_exc()
             print(e)
 
     print("Pixel3DMM tracking DONE!")
