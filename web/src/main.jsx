@@ -44,13 +44,13 @@ const expressionControls = [
 ];
 
 const panicExpressionControls = [
-  { label: "Brow raise", index: 0, min: -1, max: 1.5 },
-  { label: "Smile", index: 3, min: -1, max: 2 },
+  { label: "Brow up / down", index: 0, min: -1, max: 1.5 },
+  { label: "Smile", index: 3, min: 0, max: 2 },
   { label: "Mouth open", index: 4, min: 0, max: 2 },
-  { label: "Blink / squint", index: 7, min: 0, max: 2 },
-  { label: "Cheek puff", index: 8, min: -1, max: 1.5 },
+  { label: "Relaxed eyelids", index: 7, min: 0, max: 2 },
+  { label: "Iris shrink", index: 8, min: 0, max: 2 },
   { label: "Frown", index: 9, min: 0, max: 1.5 },
-  { label: "Asymmetry", index: 11, min: -1.5, max: 1.5 },
+  { label: "Smirk", index: 11, min: 0, max: 2 },
 ];
 
 const flexCameraControls = [
@@ -466,7 +466,13 @@ function App() {
           <GenerateStep selectedInput={selectedInput} isBusy={isBusy} onGenerate={generateSelected} />
         )}
         {activeStep === "preview" && (
-          <PreviewStep controls={controls} setControls={setControls} hasAvatar={hasAvatar} renderer={state?.renderer} />
+          <PreviewStep
+            controls={controls}
+            setControls={setControls}
+            hasAvatar={hasAvatar}
+            renderer={state?.renderer}
+            animeExpressionHandler={state?.animeExpressionHandler}
+          />
         )}
         {activeStep === "webcam" && (
           <WebcamStep
@@ -600,7 +606,7 @@ function GenerateStep({ selectedInput, isBusy, onGenerate }) {
   );
 }
 
-function PreviewStep({ controls, setControls, hasAvatar, renderer }) {
+function PreviewStep({ controls, setControls, hasAvatar, renderer, animeExpressionHandler }) {
   const isPanic = renderer === "panic3d";
   const activeExpressionControls = isPanic ? panicExpressionControls : expressionControls.map((label, index) => ({
     label,
@@ -628,7 +634,7 @@ function PreviewStep({ controls, setControls, hasAvatar, renderer }) {
       {hasAvatar && renderer === "panic3d" && (
         <div className="rendererCard">
           <Sparkles size={18} />
-          <span>PAniC-3D anime adapter controls</span>
+          <span>{animeExpressionHandler === "tha4" ? "THA4 anime expression handler" : "Anime adapter controls"}</span>
         </div>
       )}
       <div className="segmented">

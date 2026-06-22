@@ -2,6 +2,7 @@ import asyncio
 import io
 import os
 import ssl
+import sys
 import time
 import traceback
 from dataclasses import dataclass, replace
@@ -217,9 +218,117 @@ class PanicAnimeAsset:
     name: str
     source_path: Path
     image_path: Path
+    tha4_image_path: Path
     face_bbox: Optional[tuple[int, int, int, int]]
     image_offset: tuple[int, int]
     image_size: tuple[int, int]
+
+
+class Tha4ExpressionHandler:
+    def __init__(self, repo_path: Path):
+        self.repo_path = repo_path
+        src_path = repo_path / "src"
+        if str(src_path) not in sys.path:
+            sys.path.insert(0, str(src_path))
+
+        import tha4.poser.modes.mode_07 as mode_07
+        from tha4.image_util import convert_output_image_from_torch_to_numpy, resize_PIL_image
+        from tha4.poser.modes.pose_parameters import get_pose_parameters
+        from tha4.shion.base.image_util import numpy_srgb_to_linear
+
+        self._convert_output = convert_output_image_from_torch_to_numpy
+        self._srgb_to_linear = numpy_srgb_to_linear
+        self._resize_image = resize_PIL_image
+        self._pose_parameters = get_pose_parameters()
+        self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+        module_files = {
+            "eyebrow_decomposer": str(repo_path / "data" / "tha4" / "eyebrow_decomposer.pt"),
+            "eyebrow_morphing_combiner": str(repo_path / "data" / "tha4" / "eyebrow_morphing_combiner.pt"),
+            "face_morpher": str(repo_path / "data" / "tha4" / "face_morpher.pt"),
+            "body_morpher": str(repo_path / "data" / "tha4" / "body_morpher.pt"),
+            "upscaler": str(repo_path / "data" / "tha4" / "upscaler.pt"),
+        }
+        self.poser = mode_07.create_poser(self.device, module_file_names=module_files, default_output_index=0)
+        self.dtype = self.poser.get_dtype()
+        self._source_cache: dict[Path, torch.Tensor] = {}
+        self._default_pose = self._build_default_pose()
+
+    def render(
+        self,
+        source_path: Path,
+        expression: list[float],
+        yaw: float,
+        pitch: float,
+        roll: float,
+        wave: float,
+    ):
+        source = self._load_source(source_path)
+        pose = self._default_pose.clone()
+        self._set_pose(pose, "eyebrow_raised_left", self._positive(expression, 0))
+        self._set_pose(pose, "eyebrow_raised_right", self._positive(expression, 0))
+        self._set_pose(pose, "eyebrow_lowered_left", self._negative(expression, 0))
+        self._set_pose(pose, "eyebrow_lowered_right", self._negative(expression, 0))
+        self._set_pose(pose, "mouth_raised_corner_left", self._positive(expression, 3))
+        self._set_pose(pose, "mouth_raised_corner_right", self._positive(expression, 3))
+        self._set_pose(pose, "mouth_lowered_corner_left", self._positive(expression, 9))
+        self._set_pose(pose, "mouth_lowered_corner_right", self._positive(expression, 9))
+        self._set_pose(pose, "mouth_aaa", self._positive(expression, 4))
+        self._set_pose(pose, "eye_relaxed_left", self._positive(expression, 7))
+        self._set_pose(pose, "eye_relaxed_right", self._positive(expression, 7))
+        self._set_pose(pose, "iris_small_left", self._positive(expression, 8) * 0.45)
+        self._set_pose(pose, "iris_small_right", self._positive(expression, 8) * 0.45)
+        self._set_pose(pose, "mouth_smirk", self._clamp((expression[11] if len(expression) > 11 else 0.0) / 2.0, 0.0, 1.0))
+        self._set_pose(pose, "head_x", self._clamp(-pitch / 24.0, -1.0, 1.0))
+        self._set_pose(pose, "head_y", self._clamp(yaw / 32.0, -1.0, 1.0))
+        self._set_pose(pose, "neck_z", self._clamp(roll / 18.0, -1.0, 1.0))
+        self._set_pose(pose, "body_y", self._clamp(yaw / 48.0, -1.0, 1.0) * 0.35)
+        self._set_pose(pose, "body_z", self._clamp(roll / 32.0, -1.0, 1.0) * 0.35)
+        self._set_pose(pose, "breathing", self._clamp(0.45 + wave * 0.25, 0.0, 1.0))
+
+        with torch.no_grad():
+            output_image = self.poser.pose(source, pose)[0].detach().cpu()
+        array = self._convert_output(output_image)
+        return Image.fromarray(array)
+
+    def _load_source(self, source_path: Path):
+        source_path = source_path.resolve()
+        cached = self._source_cache.get(source_path)
+        if cached is not None:
+            return cached
+        image = Image.open(source_path).convert("RGBA")
+        image = self._resize_image(image, (self.poser.get_image_size(), self.poser.get_image_size()))
+        array = np.asarray(image, dtype=np.float32) / 255.0
+        array[:, :, 0:3] = self._srgb_to_linear(array[:, :, 0:3])
+        array = array * 2.0 - 1.0
+        tensor = torch.from_numpy(array.transpose(2, 0, 1)).float().to(self.device).to(self.dtype)
+        self._source_cache[source_path] = tensor
+        return tensor
+
+    def _set_pose(self, pose: torch.Tensor, name: str, value: float):
+        pose[self._pose_parameters.get_parameter_index(name)] = float(value)
+
+    def _build_default_pose(self):
+        pose = torch.zeros(self.poser.get_num_parameters(), device=self.device, dtype=self.dtype)
+        for group in self._pose_parameters.get_pose_parameter_groups():
+            default_value = float(group.get_default_value())
+            if default_value == 0.0:
+                continue
+            for offset in range(group.get_arity()):
+                pose[group.get_parameter_index() + offset] = default_value
+        return pose
+
+    def _positive(self, expression: list[float], index: int):
+        value = expression[index] if len(expression) > index else 0.0
+        return self._clamp(value / 2.0, 0.0, 1.0)
+
+    def _negative(self, expression: list[float], index: int):
+        value = expression[index] if len(expression) > index else 0.0
+        return self._clamp(-value / 2.0, 0.0, 1.0)
+
+    @staticmethod
+    def _clamp(value: float, minimum: float, maximum: float):
+        return max(minimum, min(maximum, float(value)))
 
 
 class PanicAnimeBackend:
@@ -234,10 +343,25 @@ class PanicAnimeBackend:
         self.assets_dir = Path(REPO_ROOT) / "data" / "panic3d_assets"
         self.assets_dir.mkdir(parents=True, exist_ok=True)
         self.repo_path = Path(os.environ.get("PANIC3D_REPO_PATH", Path(REPO_ROOT) / "external" / "panic3d-anime-reconstruction"))
+        self.tha4_repo_path = Path(os.environ.get("THA4_REPO_PATH", Path(REPO_ROOT) / "external" / "talking-head-anime-4-demo"))
+        self._tha4_handler = None
 
     @property
     def installed(self):
         return (self.repo_path / "readme.md").exists() or (self.repo_path / "README.md").exists()
+
+    @property
+    def expression_handler_installed(self):
+        return all(
+            (self.tha4_repo_path / "data" / "tha4" / name).exists()
+            for name in (
+                "eyebrow_decomposer.pt",
+                "eyebrow_morphing_combiner.pt",
+                "face_morpher.pt",
+                "body_morpher.pt",
+                "upscaler.pt",
+            )
+        )
 
     def route_reason(self, image_path: str):
         suffix = Path(image_path).suffix.lower()
@@ -280,11 +404,14 @@ class PanicAnimeBackend:
             )
 
         image_path = self.assets_dir / f"{avatar_name}.png"
+        tha4_image_path = self.assets_dir / f"{avatar_name}_tha4.png"
         canvas.save(image_path)
+        self._prepare_tha4_source(canvas, bbox).save(tha4_image_path)
         return PanicAnimeAsset(
             name=avatar_name,
             source_path=source,
             image_path=image_path,
+            tha4_image_path=tha4_image_path,
             face_bbox=bbox,
             image_offset=offset,
             image_size=(image.width, image.height),
@@ -301,9 +428,7 @@ class PanicAnimeBackend:
         quality: int,
     ):
         start = time.time()
-        base = Image.open(asset.image_path).convert("RGBA")
         expression = controls.get("expression") or []
-        jaw = controls.get("jaw") or [0, 0, 0]
         head = controls.get("head") or [0, 0, 0]
         mode = controls.get("mode", "default")
         playing = bool(controls.get("playing", True))
@@ -314,8 +439,15 @@ class PanicAnimeBackend:
         yaw = camera.yaw + float(head[1] if len(head) > 1 else 0) + wave * 9
         pitch = camera.pitch + float(head[0] if len(head) > 0 else 0) + wave * 2
         roll = camera.roll + float(head[2] if len(head) > 2 else 0) + wave * 2.5
-        base = self._deform_source(base, asset, driver_expression, jaw, wave, yaw, pitch)
-        base = self._pose_card(base, yaw, pitch)
+        if self.expression_handler_installed:
+            base = self._render_tha4_expression(asset, driver_expression, yaw, pitch, roll, wave)
+            yaw = 0.0
+            pitch = 0.0
+            roll = 0.0
+        else:
+            base = Image.open(asset.image_path).convert("RGBA")
+            base = self._deform_source(base, asset, driver_expression, wave, yaw, pitch)
+            base = self._pose_card(base, yaw, pitch)
 
         radius = max(0.55, min(1.8, camera.radius))
         scale = 0.72 / radius
@@ -334,16 +466,30 @@ class PanicAnimeBackend:
         rgb.save(buffer, format="JPEG", quality=quality, optimize=True)
         return buffer.getvalue(), int(1 / max(time.time() - start, 1e-6))
 
+    def _render_tha4_expression(
+        self,
+        asset: PanicAnimeAsset,
+        expression: list[float],
+        yaw: float,
+        pitch: float,
+        roll: float,
+        wave: float,
+    ):
+        handler = self._get_tha4_handler()
+        return handler.render(asset.tha4_image_path, expression, yaw, pitch, roll, wave)
+
+    def _get_tha4_handler(self):
+        if self._tha4_handler is None:
+            self._tha4_handler = Tha4ExpressionHandler(self.tha4_repo_path)
+        return self._tha4_handler
+
     def _driver_expression(self, expression: list[float], mode: str, wave: float, blink: float):
         values = [0.0] * 12
         for index, value in enumerate(expression[:12]):
             values[index] = float(value)
         if mode == "default":
             values[0] += 0.35 + 0.22 * wave
-            values[3] += 0.45 + 0.18 * wave
-            values[4] += max(0.0, wave) * 0.65
             values[7] += blink
-            values[9] += max(0.0, -wave) * 0.18
         return values
 
     def _deform_source(
@@ -351,7 +497,6 @@ class PanicAnimeBackend:
         base: Image.Image,
         asset: PanicAnimeAsset,
         expression: list[float],
-        jaw: list[float],
         wave: float,
         yaw: float,
         pitch: float,
@@ -371,41 +516,21 @@ class PanicAnimeBackend:
         dy = np.zeros((h, w), dtype=np.float32)
 
         brow = self._clamp(expression[0] / 2.0, -1.0, 1.0)
-        cheek = self._clamp(expression[2] / 2.0, -1.0, 1.0)
-        smile = self._clamp(expression[3] / 2.0, -1.0, 1.0)
-        mouth = self._clamp(expression[4] / 2.0, -1.0, 1.0)
         squint = self._clamp(expression[7] / 2.0, -1.0, 1.0)
-        puff = self._clamp(expression[8] / 2.0, -1.0, 1.0)
-        frown = self._clamp(expression[9] / 2.0, -1.0, 1.0)
-        asym = self._clamp(expression[11] / 2.0, -1.0, 1.0)
-        jaw_open = self._clamp((jaw[0] if len(jaw) > 0 else 0.0) / 25.0, -1.0, 1.0)
         yaw_norm = self._clamp(yaw / 35.0, -1.0, 1.0)
         pitch_norm = self._clamp(pitch / 35.0, -1.0, 1.0)
 
         cx = face_x + face_w * 0.5
         eye_y = face_y + face_h * 0.39
         brow_y = face_y + face_h * 0.27
-        cheek_y = face_y + face_h * 0.58
-        mouth_y = face_y + face_h * 0.74
-        jaw_y = face_y + face_h * 0.82
 
         eye_weight = self._gaussian_2d(xx, yy, cx, eye_y, face_w * 0.48, face_h * 0.105)
         brow_weight = self._gaussian_2d(xx, yy, cx, brow_y, face_w * 0.45, face_h * 0.095)
-        cheek_weight = self._gaussian_2d(xx, yy, cx, cheek_y, face_w * 0.50, face_h * 0.15)
-        mouth_weight = self._gaussian_2d(xx, yy, cx + asym * face_w * 0.06, mouth_y, face_w * 0.24, face_h * 0.105)
-        jaw_weight = self._gaussian_2d(xx, yy, cx, jaw_y, face_w * 0.40, face_h * 0.18)
 
         dy += brow_weight * brow * face_h * 0.025
         dy += eye_weight * np.sign(yy - eye_y) * squint * face_h * 0.035
-        dy -= cheek_weight * cheek * face_h * 0.025
-        dx += cheek_weight * np.sign(xx - cx) * puff * face_w * 0.025
-        dx += mouth_weight * np.sign(xx - cx) * (smile - frown * 0.45) * face_w * 0.04
-        dy -= mouth_weight * np.abs((xx - cx) / max(face_w * 0.28, 1.0)) * smile * face_h * 0.018
-        dy += mouth_weight * np.sign(yy - mouth_y) * max(mouth, jaw_open) * face_h * 0.075
-        dy += jaw_weight * max(mouth, jaw_open) * face_h * 0.028
-        dx += (brow_weight + eye_weight + cheek_weight + mouth_weight) * yaw_norm * face_w * 0.032
+        dx += (brow_weight + eye_weight) * yaw_norm * face_w * 0.022
         dy -= (brow_weight + eye_weight) * pitch_norm * face_h * 0.022
-        dy += (mouth_weight + jaw_weight) * pitch_norm * face_h * 0.018
 
         if abs(wave) > 0.001:
             breathing = self._gaussian_2d(xx, yy, cx, face_y + face_h * 1.28, face_w * 0.75, face_h * 0.42)
@@ -462,6 +587,63 @@ class PanicAnimeBackend:
             int(side * 0.50),
             int(side * 0.52),
         )
+
+    def _prepare_tha4_source(self, canvas: Image.Image, bbox: Optional[tuple[int, int, int, int]]):
+        target_size = 512
+        target_face = (192.0, 64.0, 128.0, 128.0)
+        source = self._make_border_background_transparent(canvas)
+        if bbox is None:
+            return ImageOps.contain(source, (target_size, target_size), Image.Resampling.LANCZOS)
+
+        x, y, w, h = bbox
+        if w <= 0 or h <= 0:
+            return ImageOps.contain(source, (target_size, target_size), Image.Resampling.LANCZOS)
+
+        face_cx = x + w * 0.5
+        face_cy = y + h * 0.5
+        target_face_cx = target_face[0] + target_face[2] * 0.5
+        target_face_cy = target_face[1] + target_face[3] * 0.5
+        scale = target_face[2] / max(float(w), 1.0)
+        crop_side = target_size / max(scale, 1e-6)
+        left = face_cx - target_face_cx / scale
+        top = face_cy - target_face_cy / scale
+        return self._crop_with_transparent_padding(source, left, top, crop_side).resize(
+            (target_size, target_size),
+            Image.Resampling.LANCZOS,
+        )
+
+    @staticmethod
+    def _make_border_background_transparent(image: Image.Image):
+        rgba = np.array(image.convert("RGBA"))
+        rgb = rgba[:, :, :3].astype(np.int16)
+        alpha = rgba[:, :, 3]
+        near_white = np.all(rgb > 238, axis=2) & (np.max(rgb, axis=2) - np.min(rgb, axis=2) < 14)
+        h, w = near_white.shape
+        _, labels = cv2.connectedComponents(near_white.astype(np.uint8))
+        transparent = np.zeros_like(near_white)
+        border_labels = np.unique(np.concatenate([labels[0, :], labels[-1, :], labels[:, 0], labels[:, -1]]))
+        for label in border_labels:
+            if label != 0:
+                transparent |= labels == label
+        alpha[transparent] = 0
+        rgba[:, :, 3] = alpha
+        return Image.fromarray(rgba)
+
+    @staticmethod
+    def _crop_with_transparent_padding(image: Image.Image, left: float, top: float, side: float):
+        left_i = int(np.floor(left))
+        top_i = int(np.floor(top))
+        right_i = int(np.ceil(left + side))
+        bottom_i = int(np.ceil(top + side))
+        output = Image.new("RGBA", (max(1, right_i - left_i), max(1, bottom_i - top_i)), (255, 255, 255, 0))
+        crop_left = max(0, left_i)
+        crop_top = max(0, top_i)
+        crop_right = min(image.width, right_i)
+        crop_bottom = min(image.height, bottom_i)
+        if crop_right > crop_left and crop_bottom > crop_top:
+            crop = image.crop((crop_left, crop_top, crop_right, crop_bottom))
+            output.alpha_composite(crop, (crop_left - left_i, crop_top - top_i))
+        return output
 
     @staticmethod
     def _gaussian_2d(xx, yy, cx: float, cy: float, sx: float, sy: float):
@@ -632,12 +814,12 @@ class WebAvatarSession:
         if self._panic_backend.installed:
             self._set_status(
                 f"Ready: {avatar_name} routed to the PAniC-3D anime backend. "
-                "Preview uses the shared driver controls while reconstruction export is wired next."
+                "Preview uses the THA4 expression handler while reconstruction export is wired next."
             )
         else:
             self._set_status(
                 f"Ready: {avatar_name} routed to the PAniC-3D anime backend contract. "
-                "Install PAniC-3D models to replace this style-preserving adapter preview with reconstructed geometry."
+                "THA4 handles expressions; install PAniC-3D models to replace the preview geometry."
             )
 
     def generate_avatar(self, input_path: str):
@@ -934,7 +1116,10 @@ class WebAvatarSession:
 
     def state(self):
         points = 0 if self.renderer != "flexavatar" else int(self.gaussians._xyz.shape[0]) if self.gaussians._xyz is not None else 0
-        renderer_label = "PAniC-3D Anime" if self.renderer == "panic3d" else "FlexAvatar Gaussian"
+        if self.renderer == "panic3d":
+            renderer_label = "PAniC-3D + THA4" if self._panic_backend.installed else "THA4 Anime Expressions"
+        else:
+            renderer_label = "FlexAvatar Gaussian"
         return {
             "status": self.status,
             "busy": self.busy,
@@ -944,6 +1129,7 @@ class WebAvatarSession:
             "rendererReady": self.renderer == "flexavatar" or self._panic_asset is not None,
             "hasSplat": self.renderer == "flexavatar",
             "panicInstalled": self._panic_backend.installed,
+            "animeExpressionHandler": "tha4" if self._panic_backend.expression_handler_installed else "fallback",
             "mode": self.mode,
             "playing": self.playing,
             "lockHead": self.lock_head,
