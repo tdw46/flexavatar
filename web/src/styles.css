@@ -196,6 +196,12 @@ button {
   opacity: 0.45;
 }
 
+.toolbarButtons button.selected {
+  color: #ffffff;
+  border-color: #0b8898;
+  background: #0c8998;
+}
+
 .stage {
   position: relative;
   display: grid;

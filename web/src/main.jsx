@@ -10,6 +10,7 @@ import {
   Loader2,
   Play,
   Radio,
+  Rotate3D,
   SlidersHorizontal,
   Sparkles,
   Square,
@@ -74,6 +75,7 @@ function App() {
   });
   const [webcamOn, setWebcamOn] = React.useState(false);
   const [exportedPly, setExportedPly] = React.useState(null);
+  const [viewportMode, setViewportMode] = React.useState("live");
   const [notice, setNotice] = React.useState("");
   const videoRef = React.useRef(null);
   const driveTimer = React.useRef(null);
@@ -214,6 +216,17 @@ function App() {
     setSelectedPreview(`${API_BASE}${result.url}?t=${Date.now()}`);
     setLoadedAvatar(null);
     setExportedPly(null);
+    setViewportMode("live");
+    setState((current) =>
+      current
+        ? {
+            ...current,
+            status: `Selected ${result.avatarName}. Ready to generate.`,
+            lastError: null,
+            lastGeneratedAvatar: null,
+          }
+        : current,
+    );
     setNotice(`Selected ${result.avatarName}`);
     setActiveStep("generate");
   }
@@ -240,6 +253,14 @@ function App() {
     return result;
   }
 
+  async function showSplatViewport() {
+    if (!hasAvatar) return;
+    if (!exportedPly) {
+      await exportPly();
+    }
+    setViewportMode("splat");
+  }
+
   async function generateSelected() {
     if (!selectedInput) return;
     setState((current) =>
@@ -256,6 +277,7 @@ function App() {
     setGenerationPending(true);
     setLoadedAvatar(null);
     setExportedPly(null);
+    setViewportMode("live");
     setNotice("Generation started.");
     try {
       await api("/api/generate", {
@@ -265,8 +287,8 @@ function App() {
       });
       await waitForGeneration(selectedInput.avatarName);
       setLoadedAvatar(selectedInput.avatarName);
-      setNotice(`Generated ${selectedInput.avatarName}. Opening the Three.js splat viewport.`);
-      await exportPly();
+      setViewportMode("live");
+      setNotice(`Generated ${selectedInput.avatarName}. Opening live preview controls.`);
       await refreshAvatars();
       setActiveStep("preview");
     } catch (error) {
@@ -283,8 +305,8 @@ function App() {
     setLoadedAvatar(name);
     setSelectedInput(null);
     setSelectedPreview(null);
-    setNotice(`Loaded ${name}. Opening the Three.js splat viewport.`);
-    await exportPly();
+    setViewportMode("live");
+    setNotice(`Loaded ${name}. Opening live preview controls.`);
     setActiveStep("preview");
     refreshState();
   }
@@ -342,6 +364,22 @@ function App() {
             <small>{hasAvatar ? `${state?.points?.toLocaleString() ?? "0"} points` : "Waiting for generated avatar"}</small>
           </div>
           <div className="toolbarButtons">
+            <button
+              aria-label="Live render"
+              className={hasAvatar && viewportMode === "live" ? "selected" : ""}
+              disabled={!hasAvatar}
+              onClick={() => setViewportMode("live")}
+            >
+              <Video size={17} />
+            </button>
+            <button
+              aria-label="Orbit splat"
+              className={hasAvatar && viewportMode === "splat" ? "selected" : ""}
+              disabled={!hasAvatar}
+              onClick={showSplatViewport}
+            >
+              <Rotate3D size={17} />
+            </button>
             <button aria-label="Export PLY" disabled={!hasAvatar} onClick={exportPly}>
               <Download size={17} />
             </button>
@@ -349,7 +387,7 @@ function App() {
         </div>
 
         <div className="stage">
-          {exportedPly ? (
+          {hasAvatar && viewportMode === "splat" && exportedPly ? (
             <GaussianSplatStage url={exportedPly} />
           ) : hasAvatar ? (
             <img
@@ -364,10 +402,10 @@ function App() {
         </div>
 
         <div className="statusStrip">
-          <Metric label="Render FPS" value={state?.renderFps ?? "-"} />
-          <Metric label="Animation FPS" value={state?.animationFps ?? "-"} />
-          <Metric label="Mode" value={state?.mode ?? "default"} />
-          <Metric label="Webcam" value={state?.webcamReady ? "Driving" : "Standby"} />
+          <Metric label="Render FPS" value={hasAvatar ? (state?.renderFps ?? "-") : "-"} />
+          <Metric label="Animation FPS" value={hasAvatar ? (state?.animationFps ?? "-") : "-"} />
+          <Metric label="Mode" value={hasAvatar ? (state?.mode ?? "default") : "-"} />
+          <Metric label="Webcam" value={hasAvatar && state?.webcamReady ? "Driving" : "Standby"} />
           {exportedPly && <a href={exportedPly}>Open exported PLY</a>}
         </div>
       </section>
@@ -399,6 +437,7 @@ function App() {
             webcamOn={webcamOn}
             setWebcamOn={(enabled) => {
               setWebcamOn(enabled);
+              setViewportMode("live");
               setControls((value) => ({ ...value, mode: enabled ? "webcam" : "default" }));
             }}
             videoRef={videoRef}

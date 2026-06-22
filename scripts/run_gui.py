@@ -106,6 +106,13 @@ def run_pixel3dmm(image_path: str):
                                f"{FLEXAVATAR_PIXEL3DMM_PROCESSING_PATH}/processing/itw",
                                f"{FLEXAVATAR_PIXEL3DMM_PROCESSING_PATH}/tracking/itw",
                                cleanup=True)
+                if anime_fallback_was_used() and os.environ.get("FLEXAVATAR_ALLOW_ANIME_FLAME_FALLBACK") != "1":
+                    raise RuntimeError(
+                        "Anime face fallback detected a stylized face, but the current "
+                        "Pixel3DMM/FlexAvatar path does not preserve anime style; it converts "
+                        "the input toward a photoreal FLAME face. Set "
+                        "FLEXAVATAR_ALLOW_ANIME_FLAME_FALLBACK=1 only for experimental tests."
+                    )
             except IndexError as e:
                 if anime_fallback_was_used():
                     raise RuntimeError(
@@ -117,6 +124,8 @@ def run_pixel3dmm(image_path: str):
                     "Try a front-facing photoreal portrait, or load an existing avatar code."
                 ) from e
             except Exception as e:
+                if "does not preserve anime style" in str(e):
+                    raise
                 if anime_fallback_was_used():
                     raise RuntimeError(
                         "Anime face fallback detected a face, but Pixel3DMM/FLAME tracking "

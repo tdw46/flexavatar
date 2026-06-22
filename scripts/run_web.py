@@ -101,6 +101,13 @@ def run_pixel3dmm(image_path: str):
                 f"{FLEXAVATAR_PIXEL3DMM_PROCESSING_PATH}/tracking/itw",
                 cleanup=True,
             )
+            if anime_fallback_was_used() and os.environ.get("FLEXAVATAR_ALLOW_ANIME_FLAME_FALLBACK") != "1":
+                raise RuntimeError(
+                    "Anime face fallback detected a stylized face, but the current "
+                    "Pixel3DMM/FlexAvatar path does not preserve anime style; it converts "
+                    "the input toward a photoreal FLAME face. Set "
+                    "FLEXAVATAR_ALLOW_ANIME_FLAME_FALLBACK=1 only for experimental tests."
+                )
         except IndexError as exc:
             if anime_fallback_was_used():
                 raise RuntimeError(
@@ -112,6 +119,8 @@ def run_pixel3dmm(image_path: str):
                 "Try a front-facing photoreal portrait, or load an existing avatar code."
             ) from exc
         except Exception as exc:
+            if "does not preserve anime style" in str(exc):
+                raise
             if anime_fallback_was_used():
                 raise RuntimeError(
                     "Anime face fallback detected a face, but Pixel3DMM/FLAME tracking "
@@ -583,6 +592,11 @@ async def api_upload(file: UploadFile = File(...)):
     dest = Path(FLEXAVATAR_INPUTS_PATH) / "itw" / f"{avatar_name}{dest_suffix}"
     dest.parent.mkdir(parents=True, exist_ok=True)
     dest.write_bytes(await file.read())
+    if session is not None:
+        with session.lock:
+            session.last_error = None
+            session.last_generated_avatar = None
+            session.status = f"Selected {avatar_name}. Ready to generate."
     return UploadResponse(avatarName=avatar_name, path=str(dest), url=f"/inputs/{dest.name}")
 
 
