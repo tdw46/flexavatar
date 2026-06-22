@@ -14,6 +14,9 @@ dist
 node_modules
 web/dist
 data/web_exports
+data/panic3d_assets
+data/tha4_assets
+external
 
 data/avatar_codes
 models/FLEX-1/checkpoints

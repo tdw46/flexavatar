@@ -24,7 +24,7 @@ from gaussian_splatting.gaussian_renderer import render_gsplat
 from gaussian_splatting.scene import GaussianModel
 from pixel3dmm.scripts.run_pixel3dmm import main as main_pixel3dmm
 from pixel3dmm.utils.utils_3d import matrix_to_rotation_6d, rotation_6d_to_matrix
-from PIL import Image
+from PIL import Image, ImageOps
 from pydantic import BaseModel
 from pytorch3d.transforms import matrix_to_quaternion, quaternion_to_matrix
 from scipy.spatial.transform import Rotation as R
@@ -45,6 +45,7 @@ from flexavatar.model_manager.avatar_code_manager import AvatarCodeManager
 from flexavatar.model_manager.flexavatar_model_manager import FlexAvatarModelManager
 from flexavatar.preprocessing.anime_face_fallback import (
     anime_fallback_was_used,
+    detect_anime_faces,
     install_anime_face_fallback,
     reset_anime_fallback_usage,
 )
@@ -211,11 +212,119 @@ class ControlPayload(BaseModel):
     camera: dict = {}
 
 
+@dataclass
+class PanicAnimeAsset:
+    name: str
+    source_path: Path
+    image_path: Path
+    face_bbox: Optional[tuple[int, int, int, int]]
+
+
+class PanicAnimeBackend:
+    """Adapter boundary for the anime reconstruction path.
+
+    PAniC-3D is not a drop-in FLAME/FlexAvatar avatar. This backend keeps the
+    routing, driver contract, and UI behavior separate while real PAniC-3D model
+    installation/reconstruction can be added behind the same API.
+    """
+
+    def __init__(self):
+        self.assets_dir = Path(REPO_ROOT) / "data" / "panic3d_assets"
+        self.assets_dir.mkdir(parents=True, exist_ok=True)
+        self.repo_path = Path(os.environ.get("PANIC3D_REPO_PATH", Path(REPO_ROOT) / "external" / "panic3d-anime-reconstruction"))
+
+    @property
+    def installed(self):
+        return (self.repo_path / "readme.md").exists() or (self.repo_path / "README.md").exists()
+
+    def route_reason(self, image_path: str):
+        suffix = Path(image_path).suffix.lower()
+        if suffix not in {".jpg", ".jpeg", ".png"}:
+            return None
+        image = cv2.imread(str(image_path))
+        if image is None:
+            return None
+        try:
+            faces = detect_anime_faces(image)
+        except Exception as exc:
+            print(f"PAniC anime route detection skipped: {exc}")
+            return None
+        if faces:
+            _, _, x, y, w, h = faces[0]
+            return {
+                "reason": "anime-face-cascade",
+                "bbox": (int(x), int(y), int(w), int(h)),
+            }
+        return None
+
+    def create_asset(self, avatar_name: str, source_path: str, route: Optional[dict]):
+        source = Path(source_path)
+        original = Image.open(source)
+        image = original.convert("RGBA")
+        image = ImageOps.contain(image, (1024, 1024), Image.Resampling.LANCZOS)
+        canvas = Image.new("RGBA", (1024, 1024), (255, 255, 255, 0))
+        offset = ((1024 - image.width) // 2, (1024 - image.height) // 2)
+        canvas.alpha_composite(image, offset)
+
+        bbox = route.get("bbox") if route else None
+        if bbox:
+            scale = min(1024 / max(1, original.width), 1024 / max(1, original.height))
+            bbox = tuple(int(value * scale) for value in bbox)
+
+        image_path = self.assets_dir / f"{avatar_name}.png"
+        canvas.save(image_path)
+        return PanicAnimeAsset(
+            name=avatar_name,
+            source_path=source,
+            image_path=image_path,
+            face_bbox=bbox,
+        )
+
+    def render_jpeg(
+        self,
+        asset: PanicAnimeAsset,
+        camera: WebCamera,
+        controls: dict,
+        frame_index: int,
+        width: int,
+        height: int,
+        quality: int,
+    ):
+        start = time.time()
+        base = Image.open(asset.image_path).convert("RGBA")
+        head = controls.get("head") or [0, 0, 0]
+        mode = controls.get("mode", "default")
+        playing = bool(controls.get("playing", True))
+
+        wave = np.sin(frame_index / 18) if mode == "default" and playing else 0
+        yaw = camera.yaw + float(head[1] if len(head) > 1 else 0) + wave * 9
+        pitch = camera.pitch + float(head[0] if len(head) > 0 else 0) + wave * 2
+        roll = camera.roll + float(head[2] if len(head) > 2 else 0) + wave * 2.5
+
+        radius = max(0.55, min(1.8, camera.radius))
+        scale = 0.72 / radius
+        target_w = max(96, int(width * min(0.92, scale)))
+        target_h = max(96, int(height * min(0.92, scale)))
+        image = ImageOps.contain(base, (target_w, target_h), Image.Resampling.LANCZOS)
+        image = image.rotate(roll * 0.18, resample=Image.Resampling.BICUBIC, expand=True)
+
+        canvas = Image.new("RGBA", (width, height), (248, 252, 252, 255))
+        x = int((width - image.width) / 2 + (yaw / 40) * width * 0.12)
+        y = int((height - image.height) / 2 - (pitch / 40) * height * 0.08)
+        canvas.alpha_composite(image, (x, y))
+
+        rgb = canvas.convert("RGB")
+        buffer = io.BytesIO()
+        rgb.save(buffer, format="JPEG", quality=quality, optimize=True)
+        return buffer.getvalue(), int(1 / max(time.time() - start, 1e-6))
+
+
 class WebAvatarSession:
     def __init__(self):
         self.lock = RLock()
         self.status = "Booting FlexAvatar web runtime..."
         self.current_avatar = "marble_sculpture"
+        self.renderer = "flexavatar"
         self.mode = "default"
         self.playing = True
         self.lock_head = False
@@ -228,6 +337,16 @@ class WebAvatarSession:
         self.webcam_ready = False
         self.export_dir = Path(REPO_ROOT) / "data" / "web_exports"
         self.export_dir.mkdir(parents=True, exist_ok=True)
+        self._panic_backend = PanicAnimeBackend()
+        self._panic_asset: PanicAnimeAsset | None = None
+        self._driver_controls = {
+            "mode": self.mode,
+            "playing": self.playing,
+            "lockHead": self.lock_head,
+            "expression": [0.0] * 12,
+            "jaw": [0.0, 0.0, 0.0],
+            "head": [0.0, 0.0, 0.0],
+        }
 
         self.camera = WebCamera()
         self.gaussians = GaussianModel(3)
@@ -337,18 +456,57 @@ class WebAvatarSession:
             )
 
         with self.lock:
+            self.renderer = "flexavatar"
+            self._panic_asset = None
             self.current_avatar = avatar_name
             self._batch = batch
             self._avatar_code = output.internal_representations
             self.gaussians = output.gaussian_models[0][0]
+
+    def _generate_panic_avatar(self, avatar_name: str, copied_path: str, route: Optional[dict]):
+        asset = self._panic_backend.create_asset(avatar_name, copied_path, route)
+        with self.lock:
+            self.renderer = "panic3d"
+            self.current_avatar = avatar_name
+            self._panic_asset = asset
+            self.last_generated_avatar = avatar_name
+            self.mode = "default"
+            self.playing = True
+            self.webcam_ready = False
+        if self._panic_backend.installed:
+            self._set_status(
+                f"Ready: {avatar_name} routed to the PAniC-3D anime backend. "
+                "Preview uses the shared driver controls while reconstruction export is wired next."
+            )
+        else:
+            self._set_status(
+                f"Ready: {avatar_name} routed to the PAniC-3D anime backend contract. "
+                "Install PAniC-3D models to replace this style-preserving adapter preview with reconstructed geometry."
+            )
 
     def generate_avatar(self, input_path: str):
         if not self.busy and not self.prepare_generation():
             return
         try:
             avatar_name, copied_path = self._copy_avatar_input(input_path)
+            panic_route = self._panic_backend.route_reason(copied_path)
+            if panic_route and os.environ.get("FLEXAVATAR_FORCE_FLAME_FOR_ANIME") != "1":
+                self._set_status(f"Detected anime input for {avatar_name}; routing to PAniC-3D backend...")
+                self._generate_panic_avatar(avatar_name, copied_path, panic_route)
+                return
+
             self._set_status(f"Tracking {avatar_name} with Pixel3DMM...")
-            run_pixel3dmm(copied_path)
+            try:
+                run_pixel3dmm(copied_path)
+            except Exception as exc:
+                if (
+                    "Anime face fallback detected" in str(exc)
+                    and os.environ.get("FLEXAVATAR_FORCE_FLAME_FOR_ANIME") != "1"
+                ):
+                    self._set_status(f"Pixel3DMM identified {avatar_name} as anime; routing to PAniC-3D backend...")
+                    self._generate_panic_avatar(avatar_name, copied_path, panic_route)
+                    return
+                raise
 
             self._set_status(f"Generating avatar code for {avatar_name}...")
             device = torch.device("cuda")
@@ -371,6 +529,8 @@ class WebAvatarSession:
 
             self._avatar_code_manager.save_avatar_code(output.internal_representations, avatar_name)
             with self.lock:
+                self.renderer = "flexavatar"
+                self._panic_asset = None
                 self.current_avatar = avatar_name
                 self._batch = batch
                 self._avatar_code = output.internal_representations
@@ -389,15 +549,26 @@ class WebAvatarSession:
             self.mode = payload.mode
             self.playing = payload.playing
             self.lock_head = payload.lock_head
-            for index, value in enumerate(payload.expression[:100]):
-                self._manual_expression_code[index] = float(value)
-            self._apply_rotation(payload.jaw[:3], 120)
-            self._apply_rotation(payload.head[:3], 126)
+            self._driver_controls = {
+                "mode": payload.mode,
+                "playing": payload.playing,
+                "lockHead": payload.lock_head,
+                "expression": [float(value) for value in payload.expression[:12]],
+                "jaw": [float(value) for value in payload.jaw[:3]],
+                "head": [float(value) for value in payload.head[:3]],
+            }
             camera = payload.camera or {}
             self.camera.yaw = float(camera.get("yaw", self.camera.yaw))
             self.camera.pitch = float(camera.get("pitch", self.camera.pitch))
             self.camera.roll = float(camera.get("roll", self.camera.roll))
             self.camera.radius = float(camera.get("radius", self.camera.radius))
+            if self.renderer == "panic3d":
+                self._set_status("PAniC anime driver controls updated.")
+                return
+            for index, value in enumerate(payload.expression[:100]):
+                self._manual_expression_code[index] = float(value)
+            self._apply_rotation(payload.jaw[:3], 120)
+            self._apply_rotation(payload.head[:3], 126)
             self._set_status("Preview controls updated.")
 
     def _apply_rotation(self, euler_angles: list[float], start: int):
@@ -417,20 +588,32 @@ class WebAvatarSession:
                 time.sleep(0.05)
                 continue
 
+            is_non_flex_renderer = False
             with self.lock:
-                mode = self.mode
-                playing = self.playing
-                lock_head = self.lock_head
-                batch = self._batch
-                avatar_code = self._avatar_code
-                if mode == "webcam":
-                    expression_code = self._last_expression_code
-                elif mode == "manual":
-                    expression_code = self._manual_expression_code
-                else:
-                    expression_code = self._expression_codes[self.frame_index]
-                    if playing:
-                        self.frame_index = (self.frame_index + 1) % len(self._expression_codes)
+                if self.renderer != "flexavatar":
+                    if self.playing:
+                        self.frame_index = (self.frame_index + 1) % 360
+                    now = time.time()
+                    self.animation_fps = int(1 / max(now - last_time, 1e-6))
+                    last_time = now
+                    is_non_flex_renderer = True
+                if not is_non_flex_renderer:
+                    mode = self.mode
+                    playing = self.playing
+                    lock_head = self.lock_head
+                    batch = self._batch
+                    avatar_code = self._avatar_code
+                    if mode == "webcam":
+                        expression_code = self._last_expression_code
+                    elif mode == "manual":
+                        expression_code = self._manual_expression_code
+                    else:
+                        expression_code = self._expression_codes[self.frame_index]
+                        if playing:
+                            self.frame_index = (self.frame_index + 1) % len(self._expression_codes)
+            if is_non_flex_renderer:
+                time.sleep(1 / 30)
+                continue
 
             animated_batch = replace(batch, expression_codes=expression_code[None][None])
             with torch.no_grad():
@@ -460,6 +643,18 @@ class WebAvatarSession:
         with self.lock:
             self.camera.image_width = width
             self.camera.image_height = height
+            if self.renderer == "panic3d" and self._panic_asset is not None:
+                jpeg, fps = self._panic_backend.render_jpeg(
+                    self._panic_asset,
+                    self.camera,
+                    self._driver_controls,
+                    self.frame_index,
+                    width,
+                    height,
+                    quality,
+                )
+                self.render_fps = fps
+                return jpeg
 
             class Cam:
                 FoVx = float(np.radians(self.camera.fovx))
@@ -483,6 +678,8 @@ class WebAvatarSession:
 
     def export_ply(self):
         with self.lock:
+            if self.renderer != "flexavatar":
+                raise RuntimeError("PLY export is only available for FlexAvatar Gaussian avatars.")
             path = self.export_dir / f"{self.current_avatar}.ply"
             original_scaling = self.gaussians._scaling
             original_opacity = self.gaussians._opacity
@@ -497,6 +694,15 @@ class WebAvatarSession:
         return path
 
     def drive_from_image(self, image_bytes: bytes):
+        with self.lock:
+            if self.renderer == "panic3d":
+                self.mode = "webcam"
+                self.playing = False
+                self.webcam_ready = True
+                self._driver_controls["mode"] = "webcam"
+                self._driver_controls["playing"] = False
+                self._set_status("Webcam test frame received by PAniC anime driver adapter.")
+                return
         if self._sheap_module is None:
             self._set_status("Loading SHeaP webcam driver...")
             self._sheap_module = SheapModule()
@@ -515,11 +721,17 @@ class WebAvatarSession:
         self._set_status("Driving avatar from browser webcam.")
 
     def state(self):
-        points = int(self.gaussians._xyz.shape[0]) if self.gaussians._xyz is not None else 0
+        points = 0 if self.renderer != "flexavatar" else int(self.gaussians._xyz.shape[0]) if self.gaussians._xyz is not None else 0
+        renderer_label = "PAniC-3D Anime" if self.renderer == "panic3d" else "FlexAvatar Gaussian"
         return {
             "status": self.status,
             "busy": self.busy,
             "currentAvatar": self.current_avatar,
+            "renderer": self.renderer,
+            "rendererLabel": renderer_label,
+            "rendererReady": self.renderer == "flexavatar" or self._panic_asset is not None,
+            "hasSplat": self.renderer == "flexavatar",
+            "panicInstalled": self._panic_backend.installed,
             "mode": self.mode,
             "playing": self.playing,
             "lockHead": self.lock_head,
@@ -646,7 +858,10 @@ async def api_stream(width: int = 1280, height: int = 720):
 
 @app.post("/api/export-ply")
 def api_export_ply():
-    path = get_session().export_ply()
+    try:
+        path = get_session().export_ply()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {"ok": True, "url": f"/exports/{path.name}", "path": str(path)}
 
 

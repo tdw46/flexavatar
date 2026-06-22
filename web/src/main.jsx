@@ -247,14 +247,23 @@ function App() {
   }
 
   async function exportPly() {
-    const result = await api("/api/export-ply", { method: "POST" });
-    setExportedPly(`${API_BASE}${result.url}`);
-    setNotice("PLY exported for web splat viewers.");
-    return result;
+    try {
+      const result = await api("/api/export-ply", { method: "POST" });
+      setExportedPly(`${API_BASE}${result.url}`);
+      setNotice("PLY exported for web splat viewers.");
+      return result;
+    } catch (error) {
+      setNotice(error.message);
+      throw error;
+    }
   }
 
   async function showSplatViewport() {
     if (!hasAvatar) return;
+    if (!state?.hasSplat) {
+      setNotice("Orbit splat view is available after FlexAvatar Gaussian generation.");
+      return;
+    }
     if (!exportedPly) {
       await exportPly();
     }
@@ -285,10 +294,10 @@ function App() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ path: selectedInput.path }),
       });
-      await waitForGeneration(selectedInput.avatarName);
+      const finalState = await waitForGeneration(selectedInput.avatarName);
       setLoadedAvatar(selectedInput.avatarName);
       setViewportMode("live");
-      setNotice(`Generated ${selectedInput.avatarName}. Opening live preview controls.`);
+      setNotice(`Generated ${selectedInput.avatarName}. Opening ${finalState.rendererLabel ?? "live"} preview controls.`);
       await refreshAvatars();
       setActiveStep("preview");
     } catch (error) {
@@ -313,6 +322,8 @@ function App() {
 
   const isBusy = state?.busy || generationPending;
   const hasAvatar = Boolean(loadedAvatar);
+  const hasSplat = Boolean(hasAvatar && state?.hasSplat);
+  const rendererLabel = state?.rendererLabel ?? "FlexAvatar Gaussian";
   const displayAvatar = loadedAvatar ?? selectedInput?.avatarName ?? "No avatar loaded";
   const currentIndex = steps.findIndex((step) => step.id === activeStep);
 
@@ -361,7 +372,7 @@ function App() {
         <div className="viewportToolbar">
           <div>
             <strong>{displayAvatar}</strong>
-            <small>{hasAvatar ? `${state?.points?.toLocaleString() ?? "0"} points` : "Waiting for generated avatar"}</small>
+            <small>{hasAvatar ? rendererLabel : "Waiting for generated avatar"}</small>
           </div>
           <div className="toolbarButtons">
             <button
@@ -375,12 +386,12 @@ function App() {
             <button
               aria-label="Orbit splat"
               className={hasAvatar && viewportMode === "splat" ? "selected" : ""}
-              disabled={!hasAvatar}
+              disabled={!hasSplat}
               onClick={showSplatViewport}
             >
               <Rotate3D size={17} />
             </button>
-            <button aria-label="Export PLY" disabled={!hasAvatar} onClick={exportPly}>
+            <button aria-label="Export PLY" disabled={!hasSplat} onClick={exportPly}>
               <Download size={17} />
             </button>
           </div>
@@ -393,7 +404,7 @@ function App() {
             <img
               className="renderStream"
               src={`${API_BASE}/api/stream.mjpg?width=1280&height=720`}
-              alt="FlexAvatar live render"
+              alt="Avatar live render"
             />
           ) : (
             <StagePlaceholder selectedPreview={selectedPreview} isBusy={isBusy} />
@@ -402,6 +413,8 @@ function App() {
         </div>
 
         <div className="statusStrip">
+          <Metric label="Renderer" value={hasAvatar ? rendererLabel : "-"} />
+          <Metric label="Points" value={hasAvatar && state?.hasSplat ? (state?.points?.toLocaleString() ?? "0") : "-"} />
           <Metric label="Render FPS" value={hasAvatar ? (state?.renderFps ?? "-") : "-"} />
           <Metric label="Animation FPS" value={hasAvatar ? (state?.animationFps ?? "-") : "-"} />
           <Metric label="Mode" value={hasAvatar ? (state?.mode ?? "default") : "-"} />
@@ -430,7 +443,7 @@ function App() {
           <GenerateStep selectedInput={selectedInput} isBusy={isBusy} onGenerate={generateSelected} />
         )}
         {activeStep === "preview" && (
-          <PreviewStep controls={controls} setControls={setControls} hasAvatar={hasAvatar} />
+          <PreviewStep controls={controls} setControls={setControls} hasAvatar={hasAvatar} renderer={state?.renderer} />
         )}
         {activeStep === "webcam" && (
           <WebcamStep
@@ -554,7 +567,7 @@ function GenerateStep({ selectedInput, isBusy, onGenerate }) {
       <div className="generationCard">
         <Sparkles size={28} />
         <h2>{selectedInput ? selectedInput.avatarName : "Select an input first"}</h2>
-        <p>Pixel3DMM tracking and avatar-code generation run in the Python runtime.</p>
+        <p>Human portraits route to FlexAvatar Gaussian generation. Anime portraits route to the PAniC-3D backend path.</p>
         <button className="primaryButton" disabled={!selectedInput || isBusy} onClick={onGenerate}>
           {isBusy ? <Loader2 className="spin" size={18} /> : <Play size={18} />}
           Generate avatar
@@ -564,7 +577,7 @@ function GenerateStep({ selectedInput, isBusy, onGenerate }) {
   );
 }
 
-function PreviewStep({ controls, setControls, hasAvatar }) {
+function PreviewStep({ controls, setControls, hasAvatar, renderer }) {
   const setExpression = (index, value) => {
     setControls((current) => {
       const expression = [...current.expression];
@@ -578,6 +591,12 @@ function PreviewStep({ controls, setControls, hasAvatar }) {
       {!hasAvatar && (
         <div className="notice">
           Generate or load an avatar first. The viewport stays empty until an avatar exists.
+        </div>
+      )}
+      {hasAvatar && renderer === "panic3d" && (
+        <div className="rendererCard">
+          <Sparkles size={18} />
+          <span>PAniC-3D anime backend</span>
         </div>
       )}
       <div className="segmented">
