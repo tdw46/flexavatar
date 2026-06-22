@@ -218,6 +218,8 @@ class PanicAnimeAsset:
     source_path: Path
     image_path: Path
     face_bbox: Optional[tuple[int, int, int, int]]
+    image_offset: tuple[int, int]
+    image_size: tuple[int, int]
 
 
 class PanicAnimeBackend:
@@ -269,7 +271,13 @@ class PanicAnimeBackend:
         bbox = route.get("bbox") if route else None
         if bbox:
             scale = min(1024 / max(1, original.width), 1024 / max(1, original.height))
-            bbox = tuple(int(value * scale) for value in bbox)
+            x, y, w, h = bbox
+            bbox = (
+                int(x * scale + offset[0]),
+                int(y * scale + offset[1]),
+                int(w * scale),
+                int(h * scale),
+            )
 
         image_path = self.assets_dir / f"{avatar_name}.png"
         canvas.save(image_path)
@@ -278,6 +286,8 @@ class PanicAnimeBackend:
             source_path=source,
             image_path=image_path,
             face_bbox=bbox,
+            image_offset=offset,
+            image_size=(image.width, image.height),
         )
 
     def render_jpeg(
@@ -292,11 +302,17 @@ class PanicAnimeBackend:
     ):
         start = time.time()
         base = Image.open(asset.image_path).convert("RGBA")
+        expression = controls.get("expression") or []
+        jaw = controls.get("jaw") or [0, 0, 0]
         head = controls.get("head") or [0, 0, 0]
         mode = controls.get("mode", "default")
         playing = bool(controls.get("playing", True))
 
-        wave = np.sin(frame_index / 18) if mode == "default" and playing else 0
+        wave = np.sin(frame_index / 18) if mode == "default" and playing else 0.0
+        blink = max(0.0, np.sin(frame_index / 7) - 0.82) * 5.5 if mode == "default" and playing else 0.0
+        driver_expression = self._driver_expression(expression, mode, wave, blink)
+        base = self._deform_source(base, asset, driver_expression, jaw, wave)
+
         yaw = camera.yaw + float(head[1] if len(head) > 1 else 0) + wave * 9
         pitch = camera.pitch + float(head[0] if len(head) > 0 else 0) + wave * 2
         roll = camera.roll + float(head[2] if len(head) > 2 else 0) + wave * 2.5
@@ -317,6 +333,104 @@ class PanicAnimeBackend:
         buffer = io.BytesIO()
         rgb.save(buffer, format="JPEG", quality=quality, optimize=True)
         return buffer.getvalue(), int(1 / max(time.time() - start, 1e-6))
+
+    def _driver_expression(self, expression: list[float], mode: str, wave: float, blink: float):
+        values = [0.0] * 12
+        for index, value in enumerate(expression[:12]):
+            values[index] = float(value)
+        if mode == "default":
+            values[0] += 0.35 + 0.22 * wave
+            values[3] += 0.45 + 0.18 * wave
+            values[4] += max(0.0, wave) * 0.65
+            values[7] += blink
+            values[9] += max(0.0, -wave) * 0.18
+        return values
+
+    def _deform_source(
+        self,
+        base: Image.Image,
+        asset: PanicAnimeAsset,
+        expression: list[float],
+        jaw: list[float],
+        wave: float,
+    ):
+        rgba = np.array(base)
+        if rgba.shape[2] != 4:
+            return base
+
+        h, w = rgba.shape[:2]
+        bbox = asset.face_bbox or self._fallback_face_box(asset)
+        if bbox is None:
+            return base
+
+        face_x, face_y, face_w, face_h = bbox
+        yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+        dx = np.zeros((h, w), dtype=np.float32)
+        dy = np.zeros((h, w), dtype=np.float32)
+
+        brow = self._clamp(expression[0] / 2.0, -1.0, 1.0)
+        cheek = self._clamp(expression[2] / 2.0, -1.0, 1.0)
+        smile = self._clamp(expression[3] / 2.0, -1.0, 1.0)
+        mouth = self._clamp(expression[4] / 2.0, -1.0, 1.0)
+        squint = self._clamp(expression[7] / 2.0, -1.0, 1.0)
+        puff = self._clamp(expression[8] / 2.0, -1.0, 1.0)
+        frown = self._clamp(expression[9] / 2.0, -1.0, 1.0)
+        asym = self._clamp(expression[11] / 2.0, -1.0, 1.0)
+        jaw_open = self._clamp((jaw[0] if len(jaw) > 0 else 0.0) / 25.0, -1.0, 1.0)
+
+        cx = face_x + face_w * 0.5
+        eye_y = face_y + face_h * 0.39
+        brow_y = face_y + face_h * 0.27
+        cheek_y = face_y + face_h * 0.58
+        mouth_y = face_y + face_h * 0.74
+        jaw_y = face_y + face_h * 0.82
+
+        eye_weight = self._gaussian_2d(xx, yy, cx, eye_y, face_w * 0.48, face_h * 0.105)
+        brow_weight = self._gaussian_2d(xx, yy, cx, brow_y, face_w * 0.45, face_h * 0.095)
+        cheek_weight = self._gaussian_2d(xx, yy, cx, cheek_y, face_w * 0.50, face_h * 0.15)
+        mouth_weight = self._gaussian_2d(xx, yy, cx + asym * face_w * 0.06, mouth_y, face_w * 0.24, face_h * 0.105)
+        jaw_weight = self._gaussian_2d(xx, yy, cx, jaw_y, face_w * 0.40, face_h * 0.18)
+
+        dy += brow_weight * brow * face_h * 0.025
+        dy += eye_weight * np.sign(yy - eye_y) * squint * face_h * 0.035
+        dy -= cheek_weight * cheek * face_h * 0.025
+        dx += cheek_weight * np.sign(xx - cx) * puff * face_w * 0.025
+        dx += mouth_weight * np.sign(xx - cx) * (smile - frown * 0.45) * face_w * 0.04
+        dy -= mouth_weight * np.abs((xx - cx) / max(face_w * 0.28, 1.0)) * smile * face_h * 0.018
+        dy += mouth_weight * np.sign(yy - mouth_y) * max(mouth, jaw_open) * face_h * 0.075
+        dy += jaw_weight * max(mouth, jaw_open) * face_h * 0.028
+
+        if abs(wave) > 0.001:
+            breathing = self._gaussian_2d(xx, yy, cx, face_y + face_h * 1.28, face_w * 0.75, face_h * 0.42)
+            dy += breathing * wave * face_h * 0.018
+
+        map_x = np.clip(xx - dx, 0, w - 1).astype(np.float32)
+        map_y = np.clip(yy - dy, 0, h - 1).astype(np.float32)
+        warped = cv2.remap(rgba, map_x, map_y, interpolation=cv2.INTER_CUBIC, borderMode=cv2.BORDER_TRANSPARENT)
+        return Image.fromarray(warped, mode="RGBA")
+
+    def _fallback_face_box(self, asset: PanicAnimeAsset):
+        offset_x, offset_y = asset.image_offset
+        image_w, image_h = asset.image_size
+        if image_w <= 0 or image_h <= 0:
+            return None
+        side = min(image_w, image_h)
+        return (
+            int(offset_x + image_w * 0.25),
+            int(offset_y + image_h * 0.14),
+            int(side * 0.50),
+            int(side * 0.52),
+        )
+
+    @staticmethod
+    def _gaussian_2d(xx, yy, cx: float, cy: float, sx: float, sy: float):
+        sx = max(float(sx), 1.0)
+        sy = max(float(sy), 1.0)
+        return np.exp(-(((xx - cx) ** 2) / (2 * sx * sx) + ((yy - cy) ** 2) / (2 * sy * sy))).astype(np.float32)
+
+    @staticmethod
+    def _clamp(value: float, minimum: float, maximum: float):
+        return max(minimum, min(maximum, float(value)))
 
 
 class WebAvatarSession:
@@ -352,6 +466,7 @@ class WebAvatarSession:
         self.gaussians = GaussianModel(3)
         self._window_closed = False
         self._sheap_module = None
+        self._panic_driver_prev_gray = None
 
         self._load_runtime()
         self._animation_thread = Thread(target=self._animate_avatar, daemon=True)
@@ -695,14 +810,11 @@ class WebAvatarSession:
 
     def drive_from_image(self, image_bytes: bytes):
         with self.lock:
-            if self.renderer == "panic3d":
-                self.mode = "webcam"
-                self.playing = False
-                self.webcam_ready = True
-                self._driver_controls["mode"] = "webcam"
-                self._driver_controls["playing"] = False
-                self._set_status("Webcam test frame received by PAniC anime driver adapter.")
-                return
+            is_panic = self.renderer == "panic3d"
+        if is_panic:
+            image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+            self._drive_panic_from_frame(np.array(image))
+            return
         if self._sheap_module is None:
             self._set_status("Loading SHeaP webcam driver...")
             self._sheap_module = SheapModule()
@@ -719,6 +831,65 @@ class WebAvatarSession:
             self.mode = "webcam"
             self.webcam_ready = True
         self._set_status("Driving avatar from browser webcam.")
+
+    def _drive_panic_from_frame(self, frame: np.ndarray):
+        gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
+        cascade = cv2.CascadeClassifier(str(Path(cv2.data.haarcascades) / "haarcascade_frontalface_default.xml"))
+        faces = cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=4, minSize=(80, 80))
+
+        frame_h, frame_w = gray.shape[:2]
+        expression = [0.0] * 12
+        head = [0.0, 0.0, 0.0]
+
+        if len(faces) > 0:
+            x, y, w, h = max(faces, key=lambda item: item[2] * item[3])
+            face_cx = x + w / 2
+            face_cy = y + h / 2
+            head[1] = self._clamp((0.5 - face_cx / max(frame_w, 1)) * 34, -18, 18)
+            head[0] = self._clamp((face_cy / max(frame_h, 1) - 0.48) * 28, -14, 14)
+
+            mouth_roi = gray[
+                int(y + h * 0.62): int(y + h * 0.86),
+                int(x + w * 0.32): int(x + w * 0.68),
+            ]
+            if mouth_roi.size:
+                threshold = max(20, float(np.mean(mouth_roi) - np.std(mouth_roi) * 0.55))
+                dark_ratio = float(np.mean(mouth_roi < threshold))
+                expression[4] = self._clamp((dark_ratio - 0.18) * 7.5, 0.0, 1.8)
+                expression[3] = self._clamp((w / max(frame_w, 1) - 0.20) * 3.0, 0.0, 1.0)
+
+            eye_roi = gray[
+                int(y + h * 0.26): int(y + h * 0.48),
+                int(x + w * 0.18): int(x + w * 0.82),
+            ]
+            if eye_roi.size:
+                expression[7] = self._clamp((120 - float(np.mean(eye_roi))) / 50, 0.0, 1.3)
+        elif self._panic_driver_prev_gray is not None:
+            prev = cv2.resize(self._panic_driver_prev_gray, (frame_w, frame_h))
+            diff = cv2.absdiff(gray, prev)
+            moments = cv2.moments(diff)
+            energy = float(np.mean(diff))
+            if moments["m00"] > 1e-3:
+                motion_x = moments["m10"] / moments["m00"]
+                motion_y = moments["m01"] / moments["m00"]
+                head[1] = self._clamp((0.5 - motion_x / max(frame_w, 1)) * 20, -10, 10)
+                head[0] = self._clamp((motion_y / max(frame_h, 1) - 0.5) * 16, -8, 8)
+            expression[4] = self._clamp((energy - 4) / 18, 0.0, 1.2)
+
+        self._panic_driver_prev_gray = cv2.resize(gray, (160, 160))
+        with self.lock:
+            self.mode = "webcam"
+            self.playing = False
+            self.webcam_ready = True
+            self._driver_controls["mode"] = "webcam"
+            self._driver_controls["playing"] = False
+            self._driver_controls["expression"] = expression
+            self._driver_controls["head"] = head
+        self._set_status("Driving PAniC anime adapter from browser webcam.")
+
+    @staticmethod
+    def _clamp(value: float, minimum: float, maximum: float):
+        return max(minimum, min(maximum, float(value)))
 
     def state(self):
         points = 0 if self.renderer != "flexavatar" else int(self.gaussians._xyz.shape[0]) if self.gaussians._xyz is not None else 0
