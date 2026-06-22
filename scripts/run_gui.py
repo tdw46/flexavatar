@@ -45,6 +45,11 @@ from flexavatar.model.inversion import FittingManager, FittingConfig
 from flexavatar.model.sheap import SheapModule
 from flexavatar.model_manager.avatar_code_manager import AvatarCodeManager
 from flexavatar.model_manager.flexavatar_model_manager import FlexAvatarModelManager
+from flexavatar.preprocessing.anime_face_fallback import (
+    anime_fallback_was_used,
+    install_anime_face_fallback,
+    reset_anime_fallback_usage,
+)
 from flexavatar.util.codes import interpolate_codes
 from flexavatar.viewer.viewer_utils import Mini3DViewerConfig, Mini3DViewer
 
@@ -95,15 +100,29 @@ def run_pixel3dmm(image_path: str):
                 save_img(image[..., :3], pixel3dmm_image_path)
 
             try:
+                reset_anime_fallback_usage()
+                install_anime_face_fallback(main_pixel3dmm)
                 main_pixel3dmm(pixel3dmm_image_path,
                                f"{FLEXAVATAR_PIXEL3DMM_PROCESSING_PATH}/processing/itw",
                                f"{FLEXAVATAR_PIXEL3DMM_PROCESSING_PATH}/tracking/itw",
                                cleanup=True)
             except IndexError as e:
+                if anime_fallback_was_used():
+                    raise RuntimeError(
+                        "Anime face fallback detected a face, but Pixel3DMM/FLAME tracking "
+                        f"could not fit it into a usable avatar: {e}"
+                    ) from e
                 raise RuntimeError(
                     "Pixel3DMM did not detect a supported face in this image. "
                     "Try a front-facing photoreal portrait, or load an existing avatar code."
                 ) from e
+            except Exception as e:
+                if anime_fallback_was_used():
+                    raise RuntimeError(
+                        "Anime face fallback detected a face, but Pixel3DMM/FLAME tracking "
+                        f"could not fit it into a usable avatar: {e}"
+                    ) from e
+                raise
             if Path(pixel3dmm_image_folder).is_dir():
                 rmtree(pixel3dmm_image_folder)
         except Exception as e:

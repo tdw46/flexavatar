@@ -43,6 +43,11 @@ from flexavatar.model.flexavatar_preprocessor import FlexAvatarPreprocessor
 from flexavatar.model.sheap import SheapModule
 from flexavatar.model_manager.avatar_code_manager import AvatarCodeManager
 from flexavatar.model_manager.flexavatar_model_manager import FlexAvatarModelManager
+from flexavatar.preprocessing.anime_face_fallback import (
+    anime_fallback_was_used,
+    install_anime_face_fallback,
+    reset_anime_fallback_usage,
+)
 from flexavatar.util.codes import interpolate_codes
 
 
@@ -87,6 +92,8 @@ def run_pixel3dmm(image_path: str):
         save_img(image[..., :3], pixel3dmm_input_path)
 
     try:
+        reset_anime_fallback_usage()
+        install_anime_face_fallback(main_pixel3dmm)
         try:
             main_pixel3dmm(
                 pixel3dmm_input_path,
@@ -95,10 +102,22 @@ def run_pixel3dmm(image_path: str):
                 cleanup=True,
             )
         except IndexError as exc:
+            if anime_fallback_was_used():
+                raise RuntimeError(
+                    "Anime face fallback detected a face, but Pixel3DMM/FLAME tracking "
+                    f"could not fit it into a usable avatar: {exc}"
+                ) from exc
             raise RuntimeError(
                 "Pixel3DMM did not detect a supported face in this image. "
                 "Try a front-facing photoreal portrait, or load an existing avatar code."
             ) from exc
+        except Exception as exc:
+            if anime_fallback_was_used():
+                raise RuntimeError(
+                    "Anime face fallback detected a face, but Pixel3DMM/FLAME tracking "
+                    f"could not fit it into a usable avatar: {exc}"
+                ) from exc
+            raise
     finally:
         if Path(pixel3dmm_input_folder).is_dir():
             rmtree(pixel3dmm_input_folder)
