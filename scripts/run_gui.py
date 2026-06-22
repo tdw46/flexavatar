@@ -21,10 +21,11 @@ import torch
 import tyro
 from dreifus.vector.vector_torch import to_homogeneous
 from elias.folder import Folder
-from elias.util import ensure_directory_exists_for_file, save_img
+from elias.util import ensure_directory_exists_for_file, load_img, save_img
 from elias.util.io import resize_img
 from gaussian_splatting.gaussian_renderer import render_gsplat
 from gaussian_splatting.scene import GaussianModel
+from pixel3dmm.scripts.run_pixel3dmm import main as main_pixel3dmm
 from pixel3dmm.utils.utils_3d import rotation_6d_to_matrix, matrix_to_rotation_6d
 from pytorch3d.transforms import quaternion_to_matrix, matrix_to_quaternion
 from scipy.spatial.transform import Rotation as R
@@ -34,7 +35,7 @@ from flexavatar.config.dataset_config import SampleMetadata
 from flexavatar.data_adapter.example_data import create_example_batch
 from flexavatar.data_adapter.in_the_wild_data_adapter import InTheWildDataAdapter
 from flexavatar.data_adapter.nersemble_data_adapter import NeRSembleDataAdapter
-from flexavatar.env import FLEXAVATAR_INPUTS_PATH, FLEXAVATAR_AVATAR_CODE_PATH
+from flexavatar.env import FLEXAVATAR_INPUTS_PATH, FLEXAVATAR_AVATAR_CODE_PATH, FLEXAVATAR_PIXEL3DMM_PROCESSING_PATH
 from flexavatar.model.flexavatar_preprocessor import FlexAvatarPreprocessor
 from flexavatar.model.inversion import FittingManager, FittingConfig
 from flexavatar.model.sheap import SheapModule
@@ -54,23 +55,30 @@ def transform_gaussian_model(gaussian_model: GaussianModel, rigid_transform: tor
 
 def run_pixel3dmm(image_path: str):
     image_name = Path(image_path).stem
-    pixel3dmm_tracking_path = f"{PHO3DMM_ANALYSES_PATH}/viewer/tracking/{image_name}/tracking_nV1_noPho_uv2000.0_n1000.0/result.mp4"
+    pixel3dmm_tracking_path = f"{FLEXAVATAR_PIXEL3DMM_PROCESSING_PATH}/tracking/itw/{image_name}/tracking_nV1_noPho_uv2000.0_n1000.0/result.mp4"
     if Path(pixel3dmm_tracking_path).exists():
         print(f"[Skipping] {image_name} because Pixel3DMM tracking already exists")
     else:
         try:
-            data_adapter = ViewerDataAdapter(image_name)
-            viewer_image_path = f"{PHO3DMM_ANALYSES_PATH}/viewer/input_images/{image_name}{Path(image_path).suffix}"
-            print(viewer_image_path)
-            if viewer_image_path != image_path:
-                copy2(image_path, viewer_image_path)
+            data_adapter = InTheWildDataAdapter(image_name)
+            source_path = data_adapter.get_image_path(image_name)
+            pixel3dmm_image_folder = f"{FLEXAVATAR_PIXEL3DMM_PROCESSING_PATH}/processing/input/itw/{image_name}"
+            is_video = source_path.endswith(".mp4")
 
-            pixel3dmm_image_folder = f"{PHO3DMM_ANALYSES_PATH}/viewer/processing/input/{image_name}"
-            pixel3dmm_image_path = f"{pixel3dmm_image_folder}/{image_name}.png"
-            ensure_directory_exists_for_file(pixel3dmm_image_path)
-            copy2(image_path, pixel3dmm_image_path)
+            if is_video:
+                pixel3dmm_image_path = f"{pixel3dmm_image_folder}/{image_name}.mp4"
+                ensure_directory_exists_for_file(pixel3dmm_image_path)
+                copy2(source_path, pixel3dmm_image_path)
+            else:
+                pixel3dmm_image_path = f"{pixel3dmm_image_folder}/{image_name}.jpg"
+                ensure_directory_exists_for_file(pixel3dmm_image_path)
+                image = load_img(source_path)
+                save_img(image[..., :3], pixel3dmm_image_path)
 
-            main_pixel3dmm(pixel3dmm_image_folder, f"{image_name}/tracking", cleanup=True)
+            main_pixel3dmm(pixel3dmm_image_path,
+                           f"{FLEXAVATAR_PIXEL3DMM_PROCESSING_PATH}/processing/itw",
+                           f"{FLEXAVATAR_PIXEL3DMM_PROCESSING_PATH}/tracking/itw",
+                           cleanup=True)
             if Path(pixel3dmm_image_folder).is_dir():
                 rmtree(pixel3dmm_image_folder)
         except Exception as e:
@@ -128,17 +136,15 @@ class LocalViewer(Mini3DViewer):
         self._lock_head = False
         self._live_reenactment = False
         self._is_manual_animation = False
+        self._is_generating_avatar = False
+        self._selected_avatar_image_path = None
+        self._flow_status = "Select a portrait image or load an existing avatar code."
 
         #print("Initializing SHeaP...")
         # For real-time driving
         self._sheap_module = None
-        self._cam_capture = cv2.VideoCapture(0)
-        self._cam_capture = cv2.VideoCapture(0, cv2.CAP_DSHOW)
-
-        self._cam_capture.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
-        self._cam_capture.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
-        ret, frame = self._cam_capture.read()
-        self._webcam_buffer = np.zeros_like(resize_img(frame, 1/3), dtype=np.float32)
+        self._cam_capture = None
+        self._webcam_buffer = np.zeros((360, 640, 3), dtype=np.float32)
         self._webcam_buffer_large = None
         self._webcam_recording = False
 
@@ -243,10 +249,141 @@ class LocalViewer(Mini3DViewer):
     def _on_close_window(self):
         print("WINDOW CLOSE")
         self._window_closed = True
+        self._webcam_recording = False
+        self._live_reenactment = False
+        if self._cam_capture is not None:
+            self._cam_capture.release()
+            self._cam_capture = None
+
+    def _set_flow_status(self, status: str):
+        self._flow_status = status
+        print(status)
+
+    @staticmethod
+    def _avatar_name_from_path(path: str) -> str:
+        stem = Path(path).stem
+        if stem.startswith("avatar_code_"):
+            stem = stem[len("avatar_code_"):]
+        cleaned = "".join(char if char.isalnum() or char in ("-", "_") else "_" for char in stem)
+        return cleaned.strip("_") or "avatar"
+
+    def _copy_avatar_input(self, image_path: str) -> tuple[str, str]:
+        source = Path(image_path)
+        avatar_name = self._avatar_name_from_path(image_path)
+        suffix = source.suffix.lower()
+        if suffix not in {".jpg", ".jpeg", ".png", ".mp4"}:
+            raise ValueError(f"Unsupported input type: {suffix}")
+
+        dest_suffix = ".jpg" if suffix == ".jpeg" else suffix
+        dest = Path(FLEXAVATAR_INPUTS_PATH) / "itw" / f"{avatar_name}{dest_suffix}"
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        if source.resolve() != dest.resolve():
+            copy2(source, dest)
+        return avatar_name, str(dest)
+
+    def _load_avatar_for_name(self, avatar_name: str):
+        if not self._avatar_code_manager.has_avatar_code(avatar_name):
+            raise FileNotFoundError(self._avatar_code_manager.get_avatar_code_path(avatar_name))
+
+        device = torch.device("cuda")
+        data_adapter_source = InTheWildDataAdapter(avatar_name, expression_code_config=self._dataset_config.expression_code_config)
+        batch = create_example_batch(data_adapter_source, avatar_name)
+        batch = self._preprocessor.process(batch.to(device))
+        avatar_code = self._avatar_code_manager.load_avatar_code(avatar_name).to(device)
+
+        with torch.no_grad():
+            output = self._model.create_gaussian_models(batch.input_images,
+                                                        batch.features,
+                                                        batch.input_cam2worlds,
+                                                        batch.input_intrinsics,
+                                                        expression_codes=batch.input_expression_codes,
+                                                        dataset_ids=batch.dataset_ids,
+                                                        cached_internal_representations=avatar_code)
+
+        self._custom_avatar_name = avatar_name
+        self._batch = batch
+        self._avatar_code = output.internal_representations
+        self.gaussians = output.gaussian_models[0][0]
+        self.need_update = True
+
+    def _generate_avatar_from_selected_image(self):
+        if self._selected_avatar_image_path is None:
+            self._set_flow_status("Choose a portrait image before generating.")
+            return
+
+        self._is_generating_avatar = True
+        try:
+            avatar_name, copied_path = self._copy_avatar_input(self._selected_avatar_image_path)
+            self._custom_avatar_name = avatar_name
+            self._set_flow_status(f"Tracking {avatar_name} with Pixel3DMM...")
+            run_pixel3dmm(copied_path)
+
+            self._set_flow_status(f"Generating avatar code for {avatar_name}...")
+            device = torch.device("cuda")
+            data_adapter_source = InTheWildDataAdapter(avatar_name, expression_code_config=self._dataset_config.expression_code_config)
+            batch = create_example_batch(data_adapter_source, avatar_name)
+            batch = self._preprocessor.process(batch.to(device))
+
+            with torch.no_grad():
+                output = self._model.create_gaussian_models(batch.input_images,
+                                                            batch.features,
+                                                            batch.input_cam2worlds,
+                                                            batch.input_intrinsics,
+                                                            expression_codes=batch.input_expression_codes,
+                                                            dataset_ids=batch.dataset_ids)
+
+            self._avatar_code_manager.save_avatar_code(output.internal_representations, avatar_name)
+            self._batch = batch
+            self._avatar_code = output.internal_representations
+            self.gaussians = output.gaussian_models[0][0]
+            self.need_update = True
+            self._set_flow_status(f"Ready: {avatar_name}. Preview it, adjust sliders, then try webcam drive.")
+        except Exception as e:
+            self._set_flow_status(f"Generation failed: {e}")
+            print(f"[ERROR] Generation failed for {self._selected_avatar_image_path}: {e}")
+        finally:
+            self._is_generating_avatar = False
+
+    def _start_generation_thread(self):
+        if self._is_generating_avatar:
+            self._set_flow_status("Generation is already running.")
+            return
+        Thread(target=self._generate_avatar_from_selected_image, daemon=True).start()
+
+    def _ensure_webcam(self) -> bool:
+        if self._cam_capture is not None:
+            return True
+
+        capture = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+        if not capture.isOpened():
+            capture = cv2.VideoCapture(0)
+        if not capture.isOpened():
+            self._set_flow_status("Could not open webcam.")
+            return False
+
+        capture.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
+        capture.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
+        self._cam_capture = capture
+        ret, frame = self._cam_capture.read()
+        if ret:
+            self._update_webcam_buffers(frame)
+        self._set_flow_status("Webcam is ready.")
+        return True
+
+    def _update_webcam_buffers(self, frame):
+        frame_rgb = frame[..., [2, 1, 0]]
+        frame_small = resize_img(frame_rgb, (self._webcam_buffer.shape[1] / frame_rgb.shape[1],
+                                             self._webcam_buffer.shape[0] / frame_rgb.shape[0]))
+        self._webcam_buffer[:] = (frame_small / 255).astype(np.float32)
+        self._webcam_buffer_large = (frame_rgb / 255).astype(np.float32)
 
     def _animate_avatar(self):
         t = 0
         while not self._window_closed:
+            if self._is_generating_avatar:
+                time.sleep(0.05)
+                continue
+
             if self.last_time_animate is not None:
                 elapsed = time.time() - self.last_time_animate
                 fps = 1 / (elapsed + 1e-6)
@@ -255,39 +392,12 @@ class LocalViewer(Mini3DViewer):
 
             if self._need_encoder:
                 try:
-
-                    print(f"Searching for existing avatar code: {self._custom_avatar_name}")
-                    if self._avatar_code_manager.has_avatar_code(self._custom_avatar_name):
-                        self._need_encoder = False
-                        self._avatar_code = self._avatar_code_manager.load_avatar_code(self._custom_avatar_name).cuda()
-                    else:
-                        print(f"Creating new avatar {self._custom_avatar_name}...")
-                        dataset = ViewerDataset(self._dataset_config, self._custom_avatar_name)
-                        sample = dataset[0]
-                        sample.dataset_ids = torch.tensor([1])
-                        with torch.no_grad():
-                            alpha_maps = self._modnet_matter.parse(sample.input_images).cpu()
-                        sample.input_images = sample.input_images * alpha_maps[:, None] + 1 - alpha_maps[:, None]
-                        batch = dataset.collate_fn([sample])
-                        batch = batch.to(torch.device('cuda'))
-                        batch = self._preprocessor.process(batch)
-                        self._batch = batch
-                        with torch.no_grad():
-                            output = self._model.forward(self._batch, only_internal_representations=True)
-
-                        self._avatar_code = output.gaussian_models_output.internal_representations
-                        print("Done creating avatar")
-                        self._need_encoder = False
-
-                        print("Optimizing avatar...")
-                        def set_inversion_gaussian_model(output_inversion):
-                            self.gaussians = output_inversion.gaussian_models_output.gaussian_models[0][0]
-
-                        latent_avatar_code, _, _ = self._inversion_manager.run_inversion(self._batch, set_inversion_gaussian_model)
-                        self._avatar_code = latent_avatar_code
-                        print("Done optimizing avatar")
+                    self._set_flow_status(f"Loading avatar code: {self._custom_avatar_name}")
+                    self._load_avatar_for_name(self._custom_avatar_name)
+                    self._set_flow_status(f"Ready: {self._custom_avatar_name}")
                 except Exception as e:
-                    print(f"[ERROR] Error during creating avatar {self._custom_avatar_name}: {e}")
+                    self._set_flow_status(f"Could not load {self._custom_avatar_name}: {e}")
+                finally:
                     self._need_encoder = False
 
             # Real-time animation
@@ -319,6 +429,9 @@ class LocalViewer(Mini3DViewer):
             self.gaussians = gaussians
 
     def _start_live_reenactment(self):
+        if not self._ensure_webcam():
+            self._live_reenactment = False
+            return
         if self._sheap_module is None:
             print("Setting up SHeaP for live-reenactment...")
             # Lazy-load SHeaP such that startup time is not impaired
@@ -330,6 +443,9 @@ class LocalViewer(Mini3DViewer):
     def _live_reenactment_worker(self):
         while self._live_reenactment:
             ret, frame = self._cam_capture.read()
+            if not ret:
+                time.sleep(0.05)
+                continue
             frame = frame[..., [2, 1, 0]]
 
             # TODO: This is nasty, we force the webcam frame to be square because currently fast_prepare_sheap_input() doesn't work with non-square images
@@ -345,12 +461,15 @@ class LocalViewer(Mini3DViewer):
                 pass
 
     def _webcam_worker(self):
+        if not self._ensure_webcam():
+            self._webcam_recording = False
+            return
         while self._webcam_recording:
             ret, frame = self._cam_capture.read()
-            frame = frame[..., [2, 1, 0]]
-
-            self._webcam_buffer[:] = (resize_img(frame, 1/3) / 255).astype(np.float32)
-            self._webcam_buffer_large = (frame / 255).astype(np.float32)
+            if not ret:
+                time.sleep(0.05)
+                continue
+            self._update_webcam_buffers(frame)
 
     def refresh_stat(self):
         if self.last_time_fresh is not None:
@@ -361,6 +480,11 @@ class LocalViewer(Mini3DViewer):
 
         if self.last_time_animate is not None:
             dpg.set_value("_log_animation_fps", self._log_animation_fps)
+
+        if dpg.does_item_exist("_flow_status"):
+            dpg.set_value("_flow_status", self._flow_status)
+        if dpg.does_item_exist("_current_avatar_name"):
+            dpg.set_value("_current_avatar_name", self._custom_avatar_name)
 
     def get_state_dict(self):
         return {
@@ -701,6 +825,237 @@ class LocalViewer(Mini3DViewer):
                 self.need_update = False
 
             dpg.render_dearpygui_frame()
+
+
+def _define_avatar_flow_gui(self):
+    Mini3DViewer.define_gui(self)
+
+    def callback_lock_head(sender, app_data):
+        self.need_update = True
+        self._lock_head = app_data
+
+    def callback_live_reenactment(sender, app_data):
+        self._live_reenactment = app_data
+        if app_data:
+            self._start_live_reenactment()
+        else:
+            self._set_flow_status("Webcam driving stopped.")
+
+    def callback_manual_animation(sender, app_data):
+        self._is_manual_animation = app_data
+        dpg.configure_item("_group_expression_sliders", show=app_data)
+        dpg.set_value("_checkbox_default_animation", not app_data)
+
+    def callback_default_animation(sender, app_data):
+        self._is_manual_animation = not app_data
+        dpg.set_value("_checkbox_manual_animation", self._is_manual_animation)
+        dpg.configure_item("_group_expression_sliders", show=self._is_manual_animation)
+
+    def callback_reset_manual_expression(sender, app_data):
+        self._manual_expression_code = self._make_neutral_expression_code()
+        for _dim in range(10):
+            dpg.set_value(f"_slider_expr_dim_{_dim}", 0.0)
+        dpg.set_value("_slider_eyelid_112", 0.0)
+        for _ax in ["X", "Y", "Z"]:
+            dpg.set_value(f"_slider_eye_100_{_ax}", 0.0)
+            dpg.set_value(f"_slider_neck_{_ax}", 0.0)
+            dpg.set_value(f"_slider_jaw_{_ax}", 0.0)
+
+    def select_avatar_image(sender, app_data, user_data):
+        self._selected_avatar_image_path = app_data["file_path_name"]
+        self._custom_avatar_name = self._avatar_name_from_path(self._selected_avatar_image_path)
+        dpg.set_value("_selected_input_path", self._selected_avatar_image_path)
+        self._set_flow_status(f"Selected input image for {self._custom_avatar_name}.")
+
+    def select_avatar_code(sender, app_data, user_data):
+        avatar_name = self._avatar_name_from_path(app_data["file_path_name"])
+        self._custom_avatar_name = avatar_name
+        self._need_encoder = True
+        self._set_flow_status(f"Loading existing avatar code for {avatar_name}.")
+
+    def callback_reset_camera(sender, app_data):
+        self.cam.reset()
+        self.need_update = True
+
+    def callback_start_webcam(sender, app_data):
+        self._webcam_recording = app_data
+        if app_data:
+            Thread(target=self._webcam_worker, daemon=True).start()
+        else:
+            self._set_flow_status("Webcam preview stopped.")
+
+    def callback_capture_webcam_avatar(sender, app_data):
+        if not self._ensure_webcam():
+            return
+        ret, frame = self._cam_capture.read()
+        if not ret:
+            self._set_flow_status("Could not capture a webcam frame.")
+            return
+        self._update_webcam_buffers(frame)
+
+        webcam_folder = Path(FLEXAVATAR_INPUTS_PATH) / "webcam"
+        webcam_folder.mkdir(parents=True, exist_ok=True)
+        existing_ids = []
+        for path in webcam_folder.glob("webcam_*.png"):
+            try:
+                existing_ids.append(int(path.stem.split("_")[-1]))
+            except ValueError:
+                pass
+        webcam_id = max(existing_ids) + 1 if existing_ids else 0
+        input_image_path = webcam_folder / f"webcam_{webcam_id:03d}.png"
+        save_img(self._webcam_buffer_large, str(input_image_path))
+        self._selected_avatar_image_path = str(input_image_path)
+        self._custom_avatar_name = self._avatar_name_from_path(str(input_image_path))
+        dpg.set_value("_selected_input_path", str(input_image_path))
+        self._set_flow_status(f"Captured {self._custom_avatar_name}. Generate it from the Generate tab.")
+
+    def make_expr_callback(dim):
+        def callback(sender, app_data):
+            self._manual_expression_code[dim] = app_data
+        return callback
+
+    def callback_eyelids(sender, app_data):
+        self._manual_expression_code[112] = app_data
+        self._manual_expression_code[113] = app_data
+
+    def callback_eyes(sender, app_data):
+        euler_angles = [dpg.get_value(f"_slider_eye_100_{ax}") for ax in ["X", "Y", "Z"]]
+        rot_matrix = torch.tensor(
+            R.from_euler("xyz", euler_angles, degrees=True).as_matrix(),
+            dtype=torch.float32, device=self._manual_expression_code.device
+        )
+        rot6d = matrix_to_rotation_6d(rot_matrix)
+        self._manual_expression_code[100:106] = rot6d
+        self._manual_expression_code[106:112] = rot6d
+
+    def callback_neck(sender, app_data):
+        euler_angles = [dpg.get_value(f"_slider_neck_{ax}") for ax in ["X", "Y", "Z"]]
+        rot_matrix = torch.tensor(
+            R.from_euler("xyz", euler_angles, degrees=True).as_matrix(),
+            dtype=torch.float32, device=self._manual_expression_code.device
+        )
+        rot6d = matrix_to_rotation_6d(rot_matrix)
+        self._manual_expression_code[114:120] = rot6d
+        self._manual_expression_code[126:132] = rot6d
+
+    def callback_jaw(sender, app_data):
+        euler_angles = [dpg.get_value(f"_slider_jaw_{ax}") for ax in ["X", "Y", "Z"]]
+        rot_matrix = torch.tensor(
+            R.from_euler("xyz", euler_angles, degrees=True).as_matrix(),
+            dtype=torch.float32, device=self._manual_expression_code.device
+        )
+        self._manual_expression_code[120:126] = matrix_to_rotation_6d(rot_matrix)
+
+    with dpg.file_dialog(directory_selector=False, show=False, callback=select_avatar_image,
+                         tag="file_dialog_avatar_image", width=700, height=420,
+                         default_path=f"{FLEXAVATAR_INPUTS_PATH}/itw"):
+        dpg.add_file_extension(".jpg")
+        dpg.add_file_extension(".jpeg")
+        dpg.add_file_extension(".png")
+        dpg.add_file_extension(".mp4")
+
+    with dpg.file_dialog(directory_selector=False, show=False, callback=select_avatar_code,
+                         tag="file_dialog_avatar_code", width=700, height=420,
+                         default_path=f"{FLEXAVATAR_AVATAR_CODE_PATH}/itw"):
+        dpg.add_file_extension(".npy")
+
+    with dpg.texture_registry(show=False):
+        dpg.add_raw_texture(width=self._webcam_buffer.shape[1], height=self._webcam_buffer.shape[0],
+                            default_value=self._webcam_buffer, format=dpg.mvFormat_Float_rgb,
+                            tag="webcam_buffer")
+
+    with dpg.window(label="Avatar Flow", tag="_render_window", width=430, height=740, pos=(20, 20)):
+        dpg.add_text("Current avatar:")
+        dpg.add_text(self._custom_avatar_name, tag="_current_avatar_name")
+        dpg.add_text(self._flow_status, tag="_flow_status", wrap=390)
+        dpg.add_separator()
+
+        with dpg.group(horizontal=True):
+            dpg.add_text("FPS:", show=not self.cfg.demo_mode)
+            dpg.add_text("0   ", tag="_log_fps", show=not self.cfg.demo_mode)
+            dpg.add_text("Animation FPS:", show=not self.cfg.demo_mode)
+            self._log_animation_fps = "0   "
+            dpg.add_text(self._log_animation_fps, tag="_log_animation_fps", show=not self.cfg.demo_mode)
+
+        dpg.add_text(f"Points: {self.gaussians._xyz.shape[0]}")
+        dpg.add_separator()
+
+        with dpg.tab_bar(tag="_avatar_flow_tabs"):
+            with dpg.tab(label="1 Input"):
+                dpg.add_button(label="Choose portrait image", callback=lambda: dpg.show_item("file_dialog_avatar_image"))
+                dpg.add_text("No image selected", tag="_selected_input_path", wrap=380)
+                dpg.add_spacer(height=8)
+                dpg.add_button(label="Load existing avatar code", callback=lambda: dpg.show_item("file_dialog_avatar_code"))
+
+            with dpg.tab(label="2 Generate"):
+                dpg.add_button(label="Generate from selected image", callback=lambda: self._start_generation_thread())
+                dpg.add_spacer(height=8)
+                dpg.add_text("Runs Pixel3DMM tracking, creates an avatar code, then switches the preview to that avatar.", wrap=380)
+
+            with dpg.tab(label="3 Preview"):
+                dpg.add_checkbox(label="Default video animation", default_value=not self._is_manual_animation,
+                                 callback=callback_default_animation, tag="_checkbox_default_animation")
+                dpg.add_checkbox(label="Manual sliders", default_value=self._is_manual_animation,
+                                 callback=callback_manual_animation, tag="_checkbox_manual_animation")
+                dpg.add_checkbox(label="Lock head motion", default_value=self._lock_head,
+                                 callback=callback_lock_head, tag="_checkbox_lock_head")
+                dpg.add_button(label="Reset sliders", callback=callback_reset_manual_expression,
+                               tag="_button_reset_manual_expression")
+                dpg.add_button(label="Reset camera", callback=callback_reset_camera,
+                               tag="_button_reset_pose", show=not self.cfg.demo_mode)
+
+                with dpg.group(tag="_group_expression_sliders", show=self._is_manual_animation):
+                    dpg.add_separator()
+                    dpg.add_text("Expression")
+                    for _dim in range(10):
+                        dpg.add_slider_float(label=f"Dim {_dim}", tag=f"_slider_expr_dim_{_dim}", width=200,
+                                             min_value=-3.0, max_value=3.0, default_value=0.0,
+                                             callback=make_expr_callback(_dim))
+
+                    dpg.add_separator()
+                    dpg.add_slider_float(label="Eyelids", tag="_slider_eyelid_112", width=180,
+                                         min_value=-3.0, max_value=3.0, default_value=0.0,
+                                         callback=callback_eyelids)
+
+                    dpg.add_separator()
+                    _slider_width = 120
+                    with dpg.table(header_row=False, borders_innerV=False, policy=dpg.mvTable_SizingFixedFit):
+                        dpg.add_table_column()
+                        dpg.add_table_column()
+                        dpg.add_table_column()
+                        dpg.add_table_column()
+
+                        _rot_rows = [
+                            ("Jaw (deg)", [(f"_slider_jaw_{ax}", -45., 45., callback_jaw) for ax in ["X", "Y", "Z"]]),
+                            ("Eyes (deg)", [(f"_slider_eye_100_{ax}", -45., 45., callback_eyes) for ax in ["X", "Y", "Z"]]),
+                            ("Neck (deg)", [(f"_slider_neck_{ax}", -45., 45., callback_neck) for ax in ["X", "Y", "Z"]]),
+                        ]
+
+                        for _row_label, _sliders in _rot_rows:
+                            with dpg.table_row():
+                                for _tag, _mn, _mx, _cb in _sliders:
+                                    dpg.add_slider_float(label="", tag=_tag, width=_slider_width,
+                                                         min_value=_mn, max_value=_mx, default_value=0.0,
+                                                         callback=_cb)
+                                dpg.add_text(_row_label)
+
+                        with dpg.table_row():
+                            for _label, _indent in [("Pitch", 40), ("Yaw", 44), ("Roll", 47)]:
+                                dpg.add_text(_label, indent=_indent)
+                            dpg.add_text("")
+
+            with dpg.tab(label="4 Webcam"):
+                dpg.add_checkbox(label="Webcam preview", default_value=self._webcam_recording,
+                                 callback=callback_start_webcam, tag="_checkbox_webcam_recording")
+                dpg.add_button(label="Capture webcam image", tag="_button_picture_create_avatar",
+                               callback=callback_capture_webcam_avatar)
+                dpg.add_separator()
+                dpg.add_checkbox(label="Drive avatar with webcam", default_value=self._live_reenactment,
+                                 callback=callback_live_reenactment, tag="_checkbox_live_reenactment")
+                dpg.add_image("webcam_buffer", label="Webcam Input")
+
+
+LocalViewer.define_gui = _define_avatar_flow_gui
 
 
 if __name__ == "__main__":
