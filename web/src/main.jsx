@@ -44,13 +44,27 @@ const expressionControls = [
 ];
 
 const panicExpressionControls = [
-  { label: "Brow up / down", index: 0, min: -1, max: 1.5 },
-  { label: "Smile", index: 3, min: 0, max: 2 },
+  { label: "Brow up / down", index: 0, min: -1, max: 2 },
+  { label: "Brow angry", index: 1, min: 0, max: 2 },
+  { label: "Brow worried", index: 2, min: 0, max: 2 },
+  { label: "Brow happy", index: 3, min: 0, max: 2 },
   { label: "Mouth open", index: 4, min: 0, max: 2 },
-  { label: "Relaxed eyelids", index: 7, min: 0, max: 2 },
-  { label: "Iris shrink", index: 8, min: 0, max: 2 },
+  { label: "Mouth wide", index: 5, min: 0, max: 2 },
+  { label: "Mouth pucker", index: 6, min: 0, max: 2 },
+  { label: "Mouth round", index: 7, min: 0, max: 2 },
+  { label: "Smile", index: 8, min: 0, max: 2 },
   { label: "Frown", index: 9, min: 0, max: 1.5 },
-  { label: "Smirk", index: 11, min: 0, max: 2 },
+  { label: "Relaxed lids", index: 10, min: 0, max: 2 },
+  { label: "Happy blink", index: 11, min: 0, max: 2 },
+  { label: "Wide eyes", index: 12, min: 0, max: 2 },
+  { label: "Unimpressed", index: 13, min: 0, max: 2 },
+  { label: "Lower lid", index: 14, min: 0, max: 2 },
+  { label: "Iris shrink", index: 15, min: 0, max: 2 },
+  { label: "Smirk", index: 16, min: 0, max: 2 },
+  { label: "Eye look up/down", index: 17, min: -1, max: 1 },
+  { label: "Eye look side", index: 18, min: -1, max: 1 },
+  { label: "Mouth delta", index: 19, min: 0, max: 2 },
+  { label: "Brow serious", index: 20, min: 0, max: 2 },
 ];
 
 const flexCameraControls = [
@@ -63,8 +77,11 @@ const panicCameraControls = [
   { key: "yaw", label: "face turn", min: -32, max: 32 },
   { key: "pitch", label: "face nod", min: -24, max: 24 },
   { key: "roll", label: "tilt", min: -18, max: 18 },
-  { key: "radius", label: "zoom", min: 0.65, max: 1.45 },
+  { key: "radius", label: "zoom", min: 0.35, max: 1.65 },
 ];
+
+const normalizeExpression = (expression, length = 32) =>
+  Array.from({ length }, (_, index) => Number(expression?.[index] ?? 0));
 
 function cx(...classes) {
   return classes.filter(Boolean).join(" ");
@@ -91,7 +108,7 @@ function App() {
     mode: "default",
     playing: true,
     lockHead: false,
-    expression: Array(12).fill(0),
+    expression: Array(32).fill(0),
     jaw: [0, 0, 0],
     head: [0, 0, 0],
     camera: { yaw: 0, pitch: 0, roll: 0, radius: 1 },
@@ -112,7 +129,7 @@ function App() {
           mode: nextControls.mode,
           playing: nextControls.playing,
           lock_head: nextControls.lockHead,
-          expression: nextControls.expression,
+          expression: normalizeExpression(nextControls.expression),
           jaw: nextControls.jaw,
           head: nextControls.head,
           camera: nextControls.camera,
@@ -347,6 +364,7 @@ function App() {
   const hasAvatar = Boolean(loadedAvatar);
   const hasSplat = Boolean(hasAvatar && state?.hasSplat);
   const rendererLabel = state?.rendererLabel ?? "FlexAvatar Gaussian";
+  const liveStreamSize = state?.renderer === "panic3d" ? { width: 1600, height: 1600 } : { width: 1920, height: 1080 };
   const displayAvatar = loadedAvatar ?? selectedInput?.avatarName ?? "No avatar loaded";
   const currentIndex = steps.findIndex((step) => step.id === activeStep);
 
@@ -426,7 +444,7 @@ function App() {
           ) : hasAvatar ? (
             <img
               className="renderStream"
-              src={`${API_BASE}/api/stream.mjpg?width=1280&height=720`}
+              src={`${API_BASE}/api/stream.mjpg?width=${liveStreamSize.width}&height=${liveStreamSize.height}`}
               alt="Avatar live render"
             />
           ) : (
@@ -618,7 +636,7 @@ function PreviewStep({ controls, setControls, hasAvatar, renderer, animeExpressi
 
   const setExpression = (index, value) => {
     setControls((current) => {
-      const expression = [...current.expression];
+      const expression = normalizeExpression(current.expression);
       expression[index] = Number(value);
       return { ...current, mode: "manual", expression };
     });

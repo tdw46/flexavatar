@@ -265,20 +265,29 @@ class Tha4ExpressionHandler:
     ):
         source = self._load_source(source_path)
         pose = self._default_pose.clone()
-        self._set_pose(pose, "eyebrow_raised_left", self._positive(expression, 0))
-        self._set_pose(pose, "eyebrow_raised_right", self._positive(expression, 0))
-        self._set_pose(pose, "eyebrow_lowered_left", self._negative(expression, 0))
-        self._set_pose(pose, "eyebrow_lowered_right", self._negative(expression, 0))
-        self._set_pose(pose, "mouth_raised_corner_left", self._positive(expression, 3))
-        self._set_pose(pose, "mouth_raised_corner_right", self._positive(expression, 3))
+        self._set_symmetric_pose(pose, "eyebrow_raised", self._positive(expression, 0))
+        self._set_symmetric_pose(pose, "eyebrow_lowered", max(self._negative(expression, 0), self._positive(expression, 21)))
+        self._set_symmetric_pose(pose, "eyebrow_angry", self._positive(expression, 1))
+        self._set_symmetric_pose(pose, "eyebrow_troubled", self._positive(expression, 2))
+        self._set_symmetric_pose(pose, "eyebrow_happy", self._positive(expression, 3))
+        self._set_symmetric_pose(pose, "eyebrow_serious", self._positive(expression, 20))
+        self._set_symmetric_pose(pose, "mouth_raised_corner", self._positive(expression, 8))
         self._set_pose(pose, "mouth_lowered_corner_left", self._positive(expression, 9))
         self._set_pose(pose, "mouth_lowered_corner_right", self._positive(expression, 9))
         self._set_pose(pose, "mouth_aaa", self._positive(expression, 4))
-        self._set_pose(pose, "eye_relaxed_left", self._positive(expression, 7))
-        self._set_pose(pose, "eye_relaxed_right", self._positive(expression, 7))
-        self._set_pose(pose, "iris_small_left", self._positive(expression, 8) * 0.45)
-        self._set_pose(pose, "iris_small_right", self._positive(expression, 8) * 0.45)
-        self._set_pose(pose, "mouth_smirk", self._clamp((expression[11] if len(expression) > 11 else 0.0) / 2.0, 0.0, 1.0))
+        self._set_pose(pose, "mouth_iii", self._positive(expression, 5))
+        self._set_pose(pose, "mouth_uuu", self._positive(expression, 6))
+        self._set_pose(pose, "mouth_ooo", self._positive(expression, 7))
+        self._set_pose(pose, "mouth_delta", self._positive(expression, 19))
+        self._set_symmetric_pose(pose, "eye_relaxed", self._positive(expression, 10))
+        self._set_symmetric_pose(pose, "eye_happy_wink", self._positive(expression, 11))
+        self._set_symmetric_pose(pose, "eye_surprised", self._positive(expression, 12))
+        self._set_symmetric_pose(pose, "eye_unimpressed", self._positive(expression, 13))
+        self._set_symmetric_pose(pose, "eye_raised_lower_eyelid", self._positive(expression, 14))
+        self._set_symmetric_pose(pose, "iris_small", self._positive(expression, 15))
+        self._set_pose(pose, "mouth_smirk", self._positive(expression, 16))
+        self._set_pose(pose, "iris_rotation_x", self._signed(expression, 17))
+        self._set_pose(pose, "iris_rotation_y", self._signed(expression, 18))
         self._set_pose(pose, "head_x", self._clamp(-pitch / 24.0, -1.0, 1.0))
         self._set_pose(pose, "head_y", self._clamp(yaw / 32.0, -1.0, 1.0))
         self._set_pose(pose, "neck_z", self._clamp(roll / 18.0, -1.0, 1.0))
@@ -308,6 +317,10 @@ class Tha4ExpressionHandler:
     def _set_pose(self, pose: torch.Tensor, name: str, value: float):
         pose[self._pose_parameters.get_parameter_index(name)] = float(value)
 
+    def _set_symmetric_pose(self, pose: torch.Tensor, group_name: str, value: float):
+        self._set_pose(pose, f"{group_name}_left", value)
+        self._set_pose(pose, f"{group_name}_right", value)
+
     def _build_default_pose(self):
         pose = torch.zeros(self.poser.get_num_parameters(), device=self.device, dtype=self.dtype)
         for group in self._pose_parameters.get_pose_parameter_groups():
@@ -325,6 +338,10 @@ class Tha4ExpressionHandler:
     def _negative(self, expression: list[float], index: int):
         value = expression[index] if len(expression) > index else 0.0
         return self._clamp(-value / 2.0, 0.0, 1.0)
+
+    def _signed(self, expression: list[float], index: int):
+        value = expression[index] if len(expression) > index else 0.0
+        return self._clamp(value, -1.0, 1.0)
 
     @staticmethod
     def _clamp(value: float, minimum: float, maximum: float):
@@ -441,6 +458,7 @@ class PanicAnimeBackend:
         roll = camera.roll + float(head[2] if len(head) > 2 else 0) + wave * 2.5
         if self.expression_handler_installed:
             base = self._render_tha4_expression(asset, driver_expression, yaw, pitch, roll, wave)
+            base = self._crop_to_alpha(base, padding=26)
             yaw = 0.0
             pitch = 0.0
             roll = 0.0
@@ -449,10 +467,12 @@ class PanicAnimeBackend:
             base = self._deform_source(base, asset, driver_expression, wave, yaw, pitch)
             base = self._pose_card(base, yaw, pitch)
 
-        radius = max(0.55, min(1.8, camera.radius))
-        scale = 0.72 / radius
-        target_w = max(96, int(width * min(0.92, scale)))
-        target_h = max(96, int(height * min(0.92, scale)))
+        radius_min = 0.35 if self.expression_handler_installed else 0.55
+        radius = max(radius_min, min(1.8, camera.radius))
+        scale = (0.86 if self.expression_handler_installed else 0.72) / radius
+        max_fill = 0.98 if self.expression_handler_installed else 0.92
+        target_w = max(96, int(width * min(max_fill, scale)))
+        target_h = max(96, int(height * min(max_fill, scale)))
         image = ImageOps.contain(base, (target_w, target_h), Image.Resampling.LANCZOS)
         image = image.rotate(roll * 0.32, resample=Image.Resampling.BICUBIC, expand=True)
 
@@ -484,12 +504,12 @@ class PanicAnimeBackend:
         return self._tha4_handler
 
     def _driver_expression(self, expression: list[float], mode: str, wave: float, blink: float):
-        values = [0.0] * 12
-        for index, value in enumerate(expression[:12]):
+        values = [0.0] * 32
+        for index, value in enumerate(expression[:32]):
             values[index] = float(value)
         if mode == "default":
             values[0] += 0.35 + 0.22 * wave
-            values[7] += blink
+            values[10] += blink
         return values
 
     def _deform_source(
@@ -646,6 +666,19 @@ class PanicAnimeBackend:
         return output
 
     @staticmethod
+    def _crop_to_alpha(image: Image.Image, padding: int = 0):
+        rgba = image.convert("RGBA")
+        alpha = rgba.getchannel("A")
+        bbox = alpha.getbbox()
+        if bbox is None:
+            return rgba
+        left = max(0, bbox[0] - padding)
+        top = max(0, bbox[1] - padding)
+        right = min(rgba.width, bbox[2] + padding)
+        bottom = min(rgba.height, bbox[3] + padding)
+        return rgba.crop((left, top, right, bottom))
+
+    @staticmethod
     def _gaussian_2d(xx, yy, cx: float, cy: float, sx: float, sy: float):
         sx = max(float(sx), 1.0)
         sy = max(float(sy), 1.0)
@@ -680,7 +713,7 @@ class WebAvatarSession:
             "mode": self.mode,
             "playing": self.playing,
             "lockHead": self.lock_head,
-            "expression": [0.0] * 12,
+            "expression": [0.0] * 32,
             "jaw": [0.0, 0.0, 0.0],
             "head": [0.0, 0.0, 0.0],
         }
@@ -891,7 +924,7 @@ class WebAvatarSession:
                 "mode": payload.mode,
                 "playing": payload.playing,
                 "lockHead": payload.lock_head,
-                "expression": [float(value) for value in payload.expression[:12]],
+                "expression": [float(value) for value in payload.expression[:32]],
                 "jaw": [float(value) for value in payload.jaw[:3]],
                 "head": [float(value) for value in payload.head[:3]],
             }
@@ -1061,7 +1094,7 @@ class WebAvatarSession:
         faces = cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=4, minSize=(80, 80))
 
         frame_h, frame_w = gray.shape[:2]
-        expression = [0.0] * 12
+        expression = [0.0] * 32
         head = [0.0, 0.0, 0.0]
 
         if len(faces) > 0:
@@ -1079,14 +1112,14 @@ class WebAvatarSession:
                 threshold = max(20, float(np.mean(mouth_roi) - np.std(mouth_roi) * 0.55))
                 dark_ratio = float(np.mean(mouth_roi < threshold))
                 expression[4] = self._clamp((dark_ratio - 0.18) * 7.5, 0.0, 1.8)
-                expression[3] = self._clamp((w / max(frame_w, 1) - 0.20) * 3.0, 0.0, 1.0)
+                expression[8] = self._clamp((w / max(frame_w, 1) - 0.20) * 3.0, 0.0, 1.0)
 
             eye_roi = gray[
                 int(y + h * 0.26): int(y + h * 0.48),
                 int(x + w * 0.18): int(x + w * 0.82),
             ]
             if eye_roi.size:
-                expression[7] = self._clamp((120 - float(np.mean(eye_roi))) / 50, 0.0, 1.3)
+                expression[10] = self._clamp((120 - float(np.mean(eye_roi))) / 50, 0.0, 1.3)
         elif self._panic_driver_prev_gray is not None:
             prev = cv2.resize(self._panic_driver_prev_gray, (frame_w, frame_h))
             diff = cv2.absdiff(gray, prev)
@@ -1247,7 +1280,7 @@ def api_frame(width: int = 1280, height: int = 720):
 async def api_stream(width: int = 1280, height: int = 720):
     async def frames():
         while True:
-            jpeg = get_session().render_jpeg(width, height, quality=82)
+            jpeg = get_session().render_jpeg(width, height, quality=88)
             yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + jpeg + b"\r\n"
             await asyncio.sleep(1 / 20)
 
