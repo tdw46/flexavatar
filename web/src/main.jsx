@@ -490,6 +490,7 @@ function App() {
             hasAvatar={hasAvatar}
             renderer={state?.renderer}
             animeExpressionHandler={state?.animeExpressionHandler}
+            animeSuperResolution={state?.animeSuperResolution}
           />
         )}
         {activeStep === "webcam" && (
@@ -624,7 +625,7 @@ function GenerateStep({ selectedInput, isBusy, onGenerate }) {
   );
 }
 
-function PreviewStep({ controls, setControls, hasAvatar, renderer, animeExpressionHandler }) {
+function PreviewStep({ controls, setControls, hasAvatar, renderer, animeExpressionHandler, animeSuperResolution }) {
   const isPanic = renderer === "panic3d";
   const activeExpressionControls = isPanic ? panicExpressionControls : expressionControls.map((label, index) => ({
     label,
@@ -633,6 +634,11 @@ function PreviewStep({ controls, setControls, hasAvatar, renderer, animeExpressi
     max: 2,
   }));
   const activeCameraControls = isPanic ? panicCameraControls : flexCameraControls;
+  const srLabel = animeSuperResolution === "real-cugan"
+    ? " + Real-CUGAN SR"
+    : animeSuperResolution === "real-esrgan"
+      ? " + Real-ESRGAN SR"
+      : "";
 
   const setExpression = (index, value) => {
     setControls((current) => {
@@ -652,7 +658,10 @@ function PreviewStep({ controls, setControls, hasAvatar, renderer, animeExpressi
       {hasAvatar && renderer === "panic3d" && (
         <div className="rendererCard">
           <Sparkles size={18} />
-          <span>{animeExpressionHandler === "tha4" ? "THA4 anime expression handler" : "Anime adapter controls"}</span>
+          <span>
+            {animeExpressionHandler === "tha4" ? "THA4 anime expression handler" : "Anime adapter controls"}
+            {srLabel}
+          </span>
         </div>
       )}
       <div className="segmented">

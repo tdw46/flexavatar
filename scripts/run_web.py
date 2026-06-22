@@ -1,10 +1,14 @@
 import asyncio
+import hashlib
 import io
 import os
 import ssl
+import subprocess
 import sys
+import tempfile
 import time
 import traceback
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from pathlib import Path
 from shutil import copy2, rmtree
@@ -25,7 +29,7 @@ from gaussian_splatting.gaussian_renderer import render_gsplat
 from gaussian_splatting.scene import GaussianModel
 from pixel3dmm.scripts.run_pixel3dmm import main as main_pixel3dmm
 from pixel3dmm.utils.utils_3d import matrix_to_rotation_6d, rotation_6d_to_matrix
-from PIL import Image, ImageOps
+from PIL import Image, ImageFilter, ImageOps
 from pydantic import BaseModel
 from pytorch3d.transforms import matrix_to_quaternion, quaternion_to_matrix
 from scipy.spatial.transform import Rotation as R
@@ -348,6 +352,231 @@ class Tha4ExpressionHandler:
         return max(minimum, min(maximum, float(value)))
 
 
+class AnimeSuperResolution:
+    def __init__(self, model_path: Path, max_input_side: int = 256, cache_limit: int = 96):
+        import onnxruntime as ort
+
+        self.model_path = model_path
+        self.max_input_side = max(64, int(max_input_side))
+        self.cache_limit = max(8, int(cache_limit))
+        self.blend_strength = self._clamp(float(os.environ.get("FLEXAVATAR_ANIME_SR_BLEND", "0.68")), 0.0, 1.0)
+        self._session = ort.InferenceSession(str(model_path), providers=["CPUExecutionProvider"])
+        self._input_name = self._session.get_inputs()[0].name
+        self._output_name = self._session.get_outputs()[0].name
+        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="anime-sr")
+        self._lock = RLock()
+        self._cache: dict[str, Image.Image] = {}
+        self._pending: set[str] = set()
+        self._cache_order: list[str] = []
+
+    def upscale_cached(self, image: Image.Image):
+        source = image.convert("RGBA")
+        key = self._cache_key(source)
+        with self._lock:
+            cached = self._cache.get(key)
+            if cached is not None:
+                return cached.copy(), True
+            if key not in self._pending:
+                self._pending.add(key)
+                self._executor.submit(self._upscale_worker, key, source.copy())
+        return source, False
+
+    def warm(self, image: Image.Image):
+        source = image.convert("RGBA")
+        key = self._cache_key(source)
+        with self._lock:
+            if key in self._cache or key in self._pending:
+                return
+            self._pending.add(key)
+        self._upscale_worker(key, source.copy())
+
+    def stats(self):
+        with self._lock:
+            return {
+                "cached": len(self._cache),
+                "pending": len(self._pending),
+                "limit": self.cache_limit,
+            }
+
+    def _upscale_worker(self, key: str, image: Image.Image):
+        try:
+            result = self._upscale(image)
+            with self._lock:
+                self._cache[key] = result
+                self._cache_order.append(key)
+                while len(self._cache_order) > self.cache_limit:
+                    old_key = self._cache_order.pop(0)
+                    self._cache.pop(old_key, None)
+        except Exception:
+            traceback.print_exc()
+        finally:
+            with self._lock:
+                self._pending.discard(key)
+
+    def _upscale(self, image: Image.Image):
+        resized = self._resize_for_model(image)
+        rgb = np.asarray(resized.convert("RGB"), dtype=np.float32) / 255.0
+        tensor = np.transpose(rgb, (2, 0, 1))[None].astype(np.float32)
+        output = self._session.run([self._output_name], {self._input_name: tensor})[0][0]
+        output = np.transpose(output, (1, 2, 0))
+        output = np.clip(output, 0.0, 1.0)
+        rgb_image = Image.fromarray((output * 255.0 + 0.5).astype(np.uint8))
+        if self.blend_strength < 1.0:
+            baseline = resized.convert("RGB").resize(rgb_image.size, Image.Resampling.LANCZOS)
+            rgb_image = Image.blend(baseline, rgb_image, self.blend_strength)
+        alpha = resized.getchannel("A").resize(rgb_image.size, Image.Resampling.LANCZOS)
+        return Image.merge("RGBA", (*rgb_image.split(), alpha))
+
+    def _resize_for_model(self, image: Image.Image):
+        width, height = image.size
+        longest = max(width, height)
+        if longest <= self.max_input_side:
+            return image
+        scale = self.max_input_side / longest
+        next_size = (max(1, int(width * scale)), max(1, int(height * scale)))
+        return image.resize(next_size, Image.Resampling.LANCZOS)
+
+    def _cache_key(self, image: Image.Image):
+        digest = hashlib.sha1()
+        digest.update(str(self.model_path).encode("utf-8"))
+        digest.update(str(self.max_input_side).encode("ascii"))
+        digest.update(f"{self.blend_strength:.3f}".encode("ascii"))
+        digest.update(str(image.size).encode("ascii"))
+        digest.update(image.tobytes())
+        return digest.hexdigest()
+
+    @staticmethod
+    def _clamp(value: float, minimum: float, maximum: float):
+        return max(minimum, min(maximum, float(value)))
+
+
+class RealCuganSuperResolution:
+    def __init__(
+        self,
+        executable_path: Path,
+        model_dir: Path,
+        max_input_side: int = 512,
+        scale: int = 2,
+        denoise: int = -1,
+        cache_limit: int = 96,
+    ):
+        self.executable_path = executable_path.resolve()
+        self.model_dir = model_dir.resolve()
+        self.max_input_side = max(64, int(max_input_side))
+        self.scale = max(1, min(4, int(scale)))
+        self.denoise = max(-1, min(3, int(denoise)))
+        self.cache_limit = max(8, int(cache_limit))
+        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="anime-realcugan")
+        self._lock = RLock()
+        self._cache: dict[str, Image.Image] = {}
+        self._pending: set[str] = set()
+        self._cache_order: list[str] = []
+
+    def upscale_cached(self, image: Image.Image):
+        source = image.convert("RGBA")
+        key = self._cache_key(source)
+        with self._lock:
+            cached = self._cache.get(key)
+            if cached is not None:
+                return cached.copy(), True
+            if key not in self._pending:
+                self._pending.add(key)
+                self._executor.submit(self._upscale_worker, key, source.copy())
+        return source, False
+
+    def warm(self, image: Image.Image):
+        source = image.convert("RGBA")
+        key = self._cache_key(source)
+        with self._lock:
+            if key in self._cache or key in self._pending:
+                return
+            self._pending.add(key)
+        self._upscale_worker(key, source.copy())
+
+    def stats(self):
+        with self._lock:
+            return {
+                "cached": len(self._cache),
+                "pending": len(self._pending),
+                "limit": self.cache_limit,
+            }
+
+    def _upscale_worker(self, key: str, image: Image.Image):
+        try:
+            result = self._upscale(image)
+            with self._lock:
+                self._cache[key] = result
+                self._cache_order.append(key)
+                while len(self._cache_order) > self.cache_limit:
+                    old_key = self._cache_order.pop(0)
+                    self._cache.pop(old_key, None)
+        except Exception:
+            traceback.print_exc()
+        finally:
+            with self._lock:
+                self._pending.discard(key)
+
+    def _upscale(self, image: Image.Image):
+        resized = self._resize_for_model(image)
+        rgb_input = Image.new("RGBA", resized.size, (248, 252, 252, 255))
+        rgb_input.alpha_composite(resized)
+
+        with tempfile.TemporaryDirectory(prefix="flexavatar-realcugan-") as tmp:
+            tmp_dir = Path(tmp)
+            input_path = tmp_dir / "input.png"
+            output_path = tmp_dir / "output.png"
+            rgb_input.convert("RGB").save(input_path)
+            command = [
+                str(self.executable_path),
+                "-i",
+                str(input_path),
+                "-o",
+                str(output_path),
+                "-s",
+                str(self.scale),
+                "-n",
+                str(self.denoise),
+                "-m",
+                str(self.model_dir),
+                "-f",
+                "png",
+            ]
+            completed = subprocess.run(
+                command,
+                cwd=str(self.executable_path.parent),
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            if completed.returncode != 0:
+                detail = (completed.stderr or completed.stdout or "Real-CUGAN failed").strip()
+                raise RuntimeError(detail)
+            rgb_image = Image.open(output_path).convert("RGB")
+
+        alpha = resized.getchannel("A").resize(rgb_image.size, Image.Resampling.LANCZOS)
+        return Image.merge("RGBA", (*rgb_image.split(), alpha))
+
+    def _resize_for_model(self, image: Image.Image):
+        width, height = image.size
+        longest = max(width, height)
+        if longest <= self.max_input_side:
+            return image
+        scale = self.max_input_side / longest
+        next_size = (max(1, int(width * scale)), max(1, int(height * scale)))
+        return image.resize(next_size, Image.Resampling.LANCZOS)
+
+    def _cache_key(self, image: Image.Image):
+        digest = hashlib.sha1()
+        digest.update(str(self.executable_path).encode("utf-8"))
+        digest.update(str(self.model_dir).encode("utf-8"))
+        digest.update(str(self.max_input_side).encode("ascii"))
+        digest.update(str(self.scale).encode("ascii"))
+        digest.update(str(self.denoise).encode("ascii"))
+        digest.update(str(image.size).encode("ascii"))
+        digest.update(image.tobytes())
+        return digest.hexdigest()
+
+
 class PanicAnimeBackend:
     """Adapter boundary for the anime reconstruction path.
 
@@ -361,7 +590,27 @@ class PanicAnimeBackend:
         self.assets_dir.mkdir(parents=True, exist_ok=True)
         self.repo_path = Path(os.environ.get("PANIC3D_REPO_PATH", Path(REPO_ROOT) / "external" / "panic3d-anime-reconstruction"))
         self.tha4_repo_path = Path(os.environ.get("THA4_REPO_PATH", Path(REPO_ROOT) / "external" / "talking-head-anime-4-demo"))
+        self.realcugan_dir = Path(os.environ.get(
+            "FLEXAVATAR_REALCUGAN_DIR",
+            Path(REPO_ROOT) / "external" / "realcugan-ncnn-vulkan-20220728-windows",
+        ))
+        self.realcugan_executable = Path(os.environ.get(
+            "FLEXAVATAR_REALCUGAN_EXE",
+            self.realcugan_dir / "realcugan-ncnn-vulkan.exe",
+        ))
+        self.realcugan_model_dir = Path(os.environ.get(
+            "FLEXAVATAR_REALCUGAN_MODEL_DIR",
+            self.realcugan_dir / os.environ.get("FLEXAVATAR_REALCUGAN_MODEL", "models-nose"),
+        ))
+        self.sr_model_path = Path(os.environ.get(
+            "FLEXAVATAR_ANIME_SR_MODEL",
+            Path(REPO_ROOT) / "external" / "real-esrgan" / "models" / "RealESRGAN_x4plus_anime_6B.onnx",
+        ))
         self._tha4_handler = None
+        self._sr_handler = None
+        self._sr_warmup_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="anime-sr-warmup")
+        self._sr_warmup_pending: set[str] = set()
+        self._sr_warmup_lock = RLock()
 
     @property
     def installed(self):
@@ -379,6 +628,22 @@ class PanicAnimeBackend:
                 "upscaler.pt",
             )
         )
+
+    @property
+    def super_resolution_installed(self):
+        return self.realcugan_installed or self.sr_model_path.exists()
+
+    @property
+    def realcugan_installed(self):
+        return self.realcugan_executable.exists() and self.realcugan_model_dir.exists()
+
+    @property
+    def super_resolution_name(self):
+        if self.realcugan_installed and os.environ.get("FLEXAVATAR_ANIME_SR_BACKEND", "real-cugan") != "real-esrgan":
+            return "real-cugan"
+        if self.sr_model_path.exists():
+            return "real-esrgan"
+        return "off"
 
     def route_reason(self, image_path: str):
         suffix = Path(image_path).suffix.lower()
@@ -424,7 +689,7 @@ class PanicAnimeBackend:
         tha4_image_path = self.assets_dir / f"{avatar_name}_tha4.png"
         canvas.save(image_path)
         self._prepare_tha4_source(canvas, bbox).save(tha4_image_path)
-        return PanicAnimeAsset(
+        asset = PanicAnimeAsset(
             name=avatar_name,
             source_path=source,
             image_path=image_path,
@@ -433,6 +698,8 @@ class PanicAnimeBackend:
             image_offset=offset,
             image_size=(image.width, image.height),
         )
+        self.queue_slider_cache_warmup(asset)
+        return asset
 
     def render_jpeg(
         self,
@@ -449,9 +716,10 @@ class PanicAnimeBackend:
         head = controls.get("head") or [0, 0, 0]
         mode = controls.get("mode", "default")
         playing = bool(controls.get("playing", True))
+        animation_frame = int(time.time() * 30) % 360 if mode == "default" and playing else frame_index
 
-        wave = np.sin(frame_index / 18) if mode == "default" and playing else 0.0
-        blink = max(0.0, np.sin(frame_index / 7) - 0.82) * 5.5 if mode == "default" and playing else 0.0
+        wave = np.sin(animation_frame / 18) if mode == "default" and playing else 0.0
+        blink = max(0.0, np.sin(animation_frame / 7) - 0.82) * 5.5 if mode == "default" and playing else 0.0
         driver_expression = self._driver_expression(expression, mode, wave, blink)
         yaw = camera.yaw + float(head[1] if len(head) > 1 else 0) + wave * 9
         pitch = camera.pitch + float(head[0] if len(head) > 0 else 0) + wave * 2
@@ -459,6 +727,8 @@ class PanicAnimeBackend:
         if self.expression_handler_installed:
             base = self._render_tha4_expression(asset, driver_expression, yaw, pitch, roll, wave)
             base = self._crop_to_alpha(base, padding=26)
+            if self._should_super_resolve(mode, playing):
+                base, _ = self._super_resolve(base)
             yaw = 0.0
             pitch = 0.0
             roll = 0.0
@@ -474,6 +744,8 @@ class PanicAnimeBackend:
         target_w = max(96, int(width * min(max_fill, scale)))
         target_h = max(96, int(height * min(max_fill, scale)))
         image = ImageOps.contain(base, (target_w, target_h), Image.Resampling.LANCZOS)
+        if self.expression_handler_installed:
+            image = self._enhance_anime_display(image)
         image = image.rotate(roll * 0.32, resample=Image.Resampling.BICUBIC, expand=True)
 
         canvas = Image.new("RGBA", (width, height), (248, 252, 252, 255))
@@ -502,6 +774,177 @@ class PanicAnimeBackend:
         if self._tha4_handler is None:
             self._tha4_handler = Tha4ExpressionHandler(self.tha4_repo_path)
         return self._tha4_handler
+
+    def _should_super_resolve(self, mode: str, playing: bool):
+        if not self.super_resolution_installed:
+            return False
+        if os.environ.get("FLEXAVATAR_DISABLE_ANIME_SR") == "1":
+            return False
+        return mode == "manual" or not playing
+
+    def _super_resolve(self, image: Image.Image):
+        handler = self._get_sr_handler()
+        return handler.upscale_cached(image)
+
+    def _get_sr_handler(self):
+        if self._sr_handler is None:
+            cache_limit = int(os.environ.get("FLEXAVATAR_ANIME_SR_CACHE_LIMIT", "96"))
+            backend = os.environ.get("FLEXAVATAR_ANIME_SR_BACKEND", "real-cugan")
+            if backend != "real-esrgan" and self.realcugan_installed:
+                max_side = int(os.environ.get("FLEXAVATAR_ANIME_SR_INPUT", "512"))
+                scale = int(os.environ.get("FLEXAVATAR_REALCUGAN_SCALE", "2"))
+                denoise = int(os.environ.get("FLEXAVATAR_REALCUGAN_DENOISE", "0"))
+                self._sr_handler = RealCuganSuperResolution(
+                    self.realcugan_executable,
+                    self.realcugan_model_dir,
+                    max_input_side=max_side,
+                    scale=scale,
+                    denoise=denoise,
+                    cache_limit=cache_limit,
+                )
+            else:
+                max_side = int(os.environ.get("FLEXAVATAR_ANIME_SR_INPUT", "256"))
+                self._sr_handler = AnimeSuperResolution(self.sr_model_path, max_input_side=max_side, cache_limit=cache_limit)
+        return self._sr_handler
+
+    def queue_slider_cache_warmup(self, asset: PanicAnimeAsset):
+        if os.environ.get("FLEXAVATAR_DISABLE_ANIME_SR_PREWARM") == "1":
+            return
+        if not self.super_resolution_installed or not self.expression_handler_installed:
+            return
+        warmup_key = f"{asset.name}:{self.super_resolution_name}:{asset.tha4_image_path.stat().st_mtime_ns}"
+        with self._sr_warmup_lock:
+            if warmup_key in self._sr_warmup_pending:
+                return
+            self._sr_warmup_pending.add(warmup_key)
+        self._sr_warmup_executor.submit(self._warm_slider_cache_worker, warmup_key, asset)
+
+    def warm_current_pose(self, asset: PanicAnimeAsset, camera: WebCamera, controls: dict, frame_index: int):
+        if os.environ.get("FLEXAVATAR_DISABLE_ANIME_SR_PREWARM") == "1":
+            return
+        if not self._should_super_resolve(str(controls.get("mode", "default")), bool(controls.get("playing", True))):
+            return
+        expression = controls.get("expression") or []
+        head = controls.get("head") or [0, 0, 0]
+        driver_expression = self._driver_expression(expression, "manual", 0.0, 0.0)
+        yaw = camera.yaw + float(head[1] if len(head) > 1 else 0)
+        pitch = camera.pitch + float(head[0] if len(head) > 0 else 0)
+        roll = camera.roll + float(head[2] if len(head) > 2 else 0)
+        pose_key = self._warmup_pose_key(asset, driver_expression, yaw, pitch, roll, frame_index)
+        with self._sr_warmup_lock:
+            if pose_key in self._sr_warmup_pending:
+                return
+            self._sr_warmup_pending.add(pose_key)
+        self._sr_warmup_executor.submit(
+            self._warm_single_pose_worker,
+            pose_key,
+            asset,
+            driver_expression,
+            yaw,
+            pitch,
+            roll,
+            0.0,
+        )
+
+    def sr_stats(self):
+        if self._sr_handler is None:
+            return {"cached": 0, "pending": 0, "limit": 0}
+        return self._sr_handler.stats()
+
+    def _warm_slider_cache_worker(self, warmup_key: str, asset: PanicAnimeAsset):
+        try:
+            for expression, yaw, pitch, roll in self._slider_warmup_poses():
+                if os.environ.get("FLEXAVATAR_DISABLE_ANIME_SR_PREWARM") == "1":
+                    break
+                self._warm_single_pose(asset, expression, yaw, pitch, roll, 0.0)
+        except Exception:
+            traceback.print_exc()
+        finally:
+            with self._sr_warmup_lock:
+                self._sr_warmup_pending.discard(warmup_key)
+
+    def _warm_single_pose_worker(
+        self,
+        pose_key: str,
+        asset: PanicAnimeAsset,
+        expression: list[float],
+        yaw: float,
+        pitch: float,
+        roll: float,
+        wave: float,
+    ):
+        try:
+            self._warm_single_pose(asset, expression, yaw, pitch, roll, wave)
+        except Exception:
+            traceback.print_exc()
+        finally:
+            with self._sr_warmup_lock:
+                self._sr_warmup_pending.discard(pose_key)
+
+    def _warm_single_pose(
+        self,
+        asset: PanicAnimeAsset,
+        expression: list[float],
+        yaw: float,
+        pitch: float,
+        roll: float,
+        wave: float,
+    ):
+        image = self._render_tha4_expression(asset, expression, yaw, pitch, roll, wave)
+        image = self._crop_to_alpha(image, padding=26)
+        self._get_sr_handler().warm(image)
+
+    def _slider_warmup_poses(self):
+        neutral = [0.0] * 32
+        yield neutral, 0.0, 0.0, 0.0
+        controls = [
+            (0, [-1.0, 1.0, 2.0]),
+            (1, [1.0, 2.0]),
+            (2, [1.0, 2.0]),
+            (3, [1.0, 2.0]),
+            (4, [0.5, 1.0, 2.0]),
+            (5, [1.0, 2.0]),
+            (6, [1.0, 2.0]),
+            (7, [1.0, 2.0]),
+            (8, [1.0, 2.0]),
+            (9, [0.75, 1.5]),
+            (10, [1.0, 2.0]),
+            (11, [1.0, 2.0]),
+            (12, [1.0, 2.0]),
+            (13, [1.0, 2.0]),
+            (14, [1.0, 2.0]),
+            (15, [1.0, 2.0]),
+            (16, [1.0, 2.0]),
+            (17, [-1.0, 1.0]),
+            (18, [-1.0, 1.0]),
+            (19, [1.0, 2.0]),
+            (20, [1.0, 2.0]),
+        ]
+        for index, values in controls:
+            for value in values:
+                expression = [0.0] * 32
+                expression[index] = value
+                yield self._driver_expression(expression, "manual", 0.0, 0.0), 0.0, 0.0, 0.0
+        for yaw in (-16.0, 16.0):
+            yield neutral, yaw, 0.0, 0.0
+        for pitch in (-12.0, 12.0):
+            yield neutral, 0.0, pitch, 0.0
+
+    def _warmup_pose_key(
+        self,
+        asset: PanicAnimeAsset,
+        expression: list[float],
+        yaw: float,
+        pitch: float,
+        roll: float,
+        frame_index: int,
+    ):
+        digest = hashlib.sha1()
+        digest.update(asset.name.encode("utf-8"))
+        digest.update(self.super_resolution_name.encode("utf-8"))
+        digest.update(str([round(float(value), 2) for value in expression[:32]]).encode("ascii"))
+        digest.update(f"{yaw:.2f}:{pitch:.2f}:{roll:.2f}".encode("ascii"))
+        return digest.hexdigest()
 
     def _driver_expression(self, expression: list[float], mode: str, wave: float, blink: float):
         values = [0.0] * 32
@@ -677,6 +1120,16 @@ class PanicAnimeBackend:
         right = min(rgba.width, bbox[2] + padding)
         bottom = min(rgba.height, bbox[3] + padding)
         return rgba.crop((left, top, right, bottom))
+
+    @staticmethod
+    def _enhance_anime_display(image: Image.Image):
+        rgba = image.convert("RGBA")
+        alpha = rgba.getchannel("A")
+        rgb = rgba.convert("RGB")
+        rgb = rgb.filter(ImageFilter.UnsharpMask(radius=0.85, percent=82, threshold=3))
+        rgb = rgb.filter(ImageFilter.SHARPEN)
+        enhanced = Image.merge("RGBA", (*rgb.split(), alpha))
+        return enhanced
 
     @staticmethod
     def _gaussian_2d(xx, yy, cx: float, cy: float, sx: float, sy: float):
@@ -934,6 +1387,13 @@ class WebAvatarSession:
             self.camera.roll = float(camera.get("roll", self.camera.roll))
             self.camera.radius = float(camera.get("radius", self.camera.radius))
             if self.renderer == "panic3d":
+                if self._panic_asset is not None:
+                    self._panic_backend.warm_current_pose(
+                        self._panic_asset,
+                        self.camera,
+                        self._driver_controls.copy(),
+                        self.frame_index,
+                    )
                 self._set_status("PAniC anime driver controls updated.")
                 return
             for index, value in enumerate(payload.expression[:100]):
@@ -1163,6 +1623,8 @@ class WebAvatarSession:
             "hasSplat": self.renderer == "flexavatar",
             "panicInstalled": self._panic_backend.installed,
             "animeExpressionHandler": "tha4" if self._panic_backend.expression_handler_installed else "fallback",
+            "animeSuperResolution": self._panic_backend.super_resolution_name,
+            "animeSrCache": self._panic_backend.sr_stats(),
             "mode": self.mode,
             "playing": self.playing,
             "lockHead": self.lock_head,
@@ -1280,9 +1742,10 @@ def api_frame(width: int = 1280, height: int = 720):
 async def api_stream(width: int = 1280, height: int = 720):
     async def frames():
         while True:
+            frame_start = time.time()
             jpeg = get_session().render_jpeg(width, height, quality=88)
             yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + jpeg + b"\r\n"
-            await asyncio.sleep(1 / 20)
+            await asyncio.sleep(max(0.0, (1 / 24) - (time.time() - frame_start)))
 
     return StreamingResponse(frames(), media_type="multipart/x-mixed-replace; boundary=frame")
 
