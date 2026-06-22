@@ -311,22 +311,22 @@ class PanicAnimeBackend:
         wave = np.sin(frame_index / 18) if mode == "default" and playing else 0.0
         blink = max(0.0, np.sin(frame_index / 7) - 0.82) * 5.5 if mode == "default" and playing else 0.0
         driver_expression = self._driver_expression(expression, mode, wave, blink)
-        base = self._deform_source(base, asset, driver_expression, jaw, wave)
-
         yaw = camera.yaw + float(head[1] if len(head) > 1 else 0) + wave * 9
         pitch = camera.pitch + float(head[0] if len(head) > 0 else 0) + wave * 2
         roll = camera.roll + float(head[2] if len(head) > 2 else 0) + wave * 2.5
+        base = self._deform_source(base, asset, driver_expression, jaw, wave, yaw, pitch)
+        base = self._pose_card(base, yaw, pitch)
 
         radius = max(0.55, min(1.8, camera.radius))
         scale = 0.72 / radius
         target_w = max(96, int(width * min(0.92, scale)))
         target_h = max(96, int(height * min(0.92, scale)))
         image = ImageOps.contain(base, (target_w, target_h), Image.Resampling.LANCZOS)
-        image = image.rotate(roll * 0.18, resample=Image.Resampling.BICUBIC, expand=True)
+        image = image.rotate(roll * 0.32, resample=Image.Resampling.BICUBIC, expand=True)
 
         canvas = Image.new("RGBA", (width, height), (248, 252, 252, 255))
-        x = int((width - image.width) / 2 + (yaw / 40) * width * 0.12)
-        y = int((height - image.height) / 2 - (pitch / 40) * height * 0.08)
+        x = int((width - image.width) / 2 + self._clamp(yaw / 40, -1.0, 1.0) * width * 0.035)
+        y = int((height - image.height) / 2 - self._clamp(pitch / 40, -1.0, 1.0) * height * 0.028)
         canvas.alpha_composite(image, (x, y))
 
         rgb = canvas.convert("RGB")
@@ -353,6 +353,8 @@ class PanicAnimeBackend:
         expression: list[float],
         jaw: list[float],
         wave: float,
+        yaw: float,
+        pitch: float,
     ):
         rgba = np.array(base)
         if rgba.shape[2] != 4:
@@ -377,6 +379,8 @@ class PanicAnimeBackend:
         frown = self._clamp(expression[9] / 2.0, -1.0, 1.0)
         asym = self._clamp(expression[11] / 2.0, -1.0, 1.0)
         jaw_open = self._clamp((jaw[0] if len(jaw) > 0 else 0.0) / 25.0, -1.0, 1.0)
+        yaw_norm = self._clamp(yaw / 35.0, -1.0, 1.0)
+        pitch_norm = self._clamp(pitch / 35.0, -1.0, 1.0)
 
         cx = face_x + face_w * 0.5
         eye_y = face_y + face_h * 0.39
@@ -399,6 +403,9 @@ class PanicAnimeBackend:
         dy -= mouth_weight * np.abs((xx - cx) / max(face_w * 0.28, 1.0)) * smile * face_h * 0.018
         dy += mouth_weight * np.sign(yy - mouth_y) * max(mouth, jaw_open) * face_h * 0.075
         dy += jaw_weight * max(mouth, jaw_open) * face_h * 0.028
+        dx += (brow_weight + eye_weight + cheek_weight + mouth_weight) * yaw_norm * face_w * 0.032
+        dy -= (brow_weight + eye_weight) * pitch_norm * face_h * 0.022
+        dy += (mouth_weight + jaw_weight) * pitch_norm * face_h * 0.018
 
         if abs(wave) > 0.001:
             breathing = self._gaussian_2d(xx, yy, cx, face_y + face_h * 1.28, face_w * 0.75, face_h * 0.42)
@@ -407,6 +414,40 @@ class PanicAnimeBackend:
         map_x = np.clip(xx - dx, 0, w - 1).astype(np.float32)
         map_y = np.clip(yy - dy, 0, h - 1).astype(np.float32)
         warped = cv2.remap(rgba, map_x, map_y, interpolation=cv2.INTER_CUBIC, borderMode=cv2.BORDER_TRANSPARENT)
+        return Image.fromarray(warped, mode="RGBA")
+
+    def _pose_card(self, image: Image.Image, yaw: float, pitch: float):
+        yaw_norm = self._clamp(yaw / 40.0, -1.0, 1.0)
+        pitch_norm = self._clamp(pitch / 40.0, -1.0, 1.0)
+        if abs(yaw_norm) < 0.01 and abs(pitch_norm) < 0.01:
+            return image
+
+        rgba = np.array(image)
+        h, w = rgba.shape[:2]
+        src = np.float32([[0, 0], [w, 0], [w, h], [0, h]])
+        yaw_mag = abs(yaw_norm)
+        pitch_mag = abs(pitch_norm)
+        left_inset = yaw_mag * w * (0.018 if yaw_norm > 0 else 0.085)
+        right_inset = yaw_mag * w * (0.085 if yaw_norm > 0 else 0.018)
+        top_shift = pitch_norm * h * 0.032
+        bottom_shift = -pitch_norm * h * 0.026
+        top_squeeze = pitch_mag * h * 0.025
+        bottom_squeeze = pitch_mag * h * 0.018
+        dst = np.float32([
+            [left_inset, top_squeeze + top_shift],
+            [w - right_inset, top_squeeze - top_shift],
+            [w - right_inset * 0.55, h - bottom_squeeze - bottom_shift],
+            [left_inset * 0.55, h - bottom_squeeze + bottom_shift],
+        ])
+        matrix = cv2.getPerspectiveTransform(src, dst)
+        warped = cv2.warpPerspective(
+            rgba,
+            matrix,
+            (w, h),
+            flags=cv2.INTER_CUBIC,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=(255, 255, 255, 0),
+        )
         return Image.fromarray(warped, mode="RGBA")
 
     def _fallback_face_box(self, asset: PanicAnimeAsset):

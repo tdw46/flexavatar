@@ -43,6 +43,29 @@ const expressionControls = [
   "Micro asym",
 ];
 
+const panicExpressionControls = [
+  { label: "Brow raise", index: 0, min: -1, max: 1.5 },
+  { label: "Smile", index: 3, min: -1, max: 2 },
+  { label: "Mouth open", index: 4, min: 0, max: 2 },
+  { label: "Blink / squint", index: 7, min: 0, max: 2 },
+  { label: "Cheek puff", index: 8, min: -1, max: 1.5 },
+  { label: "Frown", index: 9, min: 0, max: 1.5 },
+  { label: "Asymmetry", index: 11, min: -1.5, max: 1.5 },
+];
+
+const flexCameraControls = [
+  { key: "yaw", label: "yaw", min: -40, max: 40 },
+  { key: "pitch", label: "pitch", min: -40, max: 40 },
+  { key: "radius", label: "radius", min: 0.55, max: 1.8 },
+];
+
+const panicCameraControls = [
+  { key: "yaw", label: "face turn", min: -32, max: 32 },
+  { key: "pitch", label: "face nod", min: -24, max: 24 },
+  { key: "roll", label: "tilt", min: -18, max: 18 },
+  { key: "radius", label: "zoom", min: 0.65, max: 1.45 },
+];
+
 function cx(...classes) {
   return classes.filter(Boolean).join(" ");
 }
@@ -578,6 +601,15 @@ function GenerateStep({ selectedInput, isBusy, onGenerate }) {
 }
 
 function PreviewStep({ controls, setControls, hasAvatar, renderer }) {
+  const isPanic = renderer === "panic3d";
+  const activeExpressionControls = isPanic ? panicExpressionControls : expressionControls.map((label, index) => ({
+    label,
+    index,
+    min: -2,
+    max: 2,
+  }));
+  const activeCameraControls = isPanic ? panicCameraControls : flexCameraControls;
+
   const setExpression = (index, value) => {
     setControls((current) => {
       const expression = [...current.expression];
@@ -596,7 +628,7 @@ function PreviewStep({ controls, setControls, hasAvatar, renderer }) {
       {hasAvatar && renderer === "panic3d" && (
         <div className="rendererCard">
           <Sparkles size={18} />
-          <span>PAniC-3D anime backend</span>
+          <span>PAniC-3D anime adapter controls</span>
         </div>
       )}
       <div className="segmented">
@@ -629,34 +661,35 @@ function PreviewStep({ controls, setControls, hasAvatar, renderer }) {
       </div>
 
       <section className="sliderGroup">
-        <header>Expression</header>
-        {expressionControls.map((label, index) => (
+        <header>{isPanic ? "Anime adapter" : "Expression"}</header>
+        {activeExpressionControls.map((control) => (
           <Slider
-            key={label}
-            label={label}
-            value={controls.expression[index]}
-            min={-2}
-            max={2}
+            key={control.label}
+            label={control.label}
+            value={controls.expression[control.index]}
+            min={control.min}
+            max={control.max}
             step={0.01}
-            onChange={(value) => setExpression(index, value)}
+            onChange={(value) => setExpression(control.index, value)}
           />
         ))}
       </section>
 
       <section className="sliderGroup">
-        <header>Camera</header>
-        {["yaw", "pitch", "radius"].map((key) => (
+        <header>{isPanic ? "2.5D pose" : "Camera"}</header>
+        {activeCameraControls.map((control) => (
           <Slider
-            key={key}
-            label={key}
-            value={controls.camera[key]}
-            min={key === "radius" ? 0.55 : -40}
-            max={key === "radius" ? 1.8 : 40}
+            key={control.key}
+            label={control.label}
+            value={controls.camera[control.key]}
+            min={control.min}
+            max={control.max}
             step={0.01}
             onChange={(value) =>
               setControls((current) => ({
                 ...current,
-                camera: { ...current.camera, [key]: Number(value) },
+                mode: "manual",
+                camera: { ...current.camera, [control.key]: Number(value) },
               }))
             }
           />
