@@ -17,6 +17,7 @@ import {
   Upload,
   Video,
 } from "lucide-react";
+import { Anime4KCanvas } from "./anime4kCanvas.jsx";
 import "./styles.css";
 
 const API_BASE = import.meta.env.VITE_API_BASE ?? "http://127.0.0.1:8000";
@@ -120,6 +121,7 @@ function App() {
     playing: true,
     lockHead: false,
     interacting: false,
+    anime4k: true,
     expression: Array(32).fill(0),
     jaw: [0, 0, 0],
     head: [0, 0, 0],
@@ -431,15 +433,14 @@ function App() {
   const rendererLabel = state?.rendererLabel ?? "FlexAvatar Gaussian";
   const liveStreamSize = state?.renderer === "panic3d" ? { width: 1600, height: 1600 } : { width: 1920, height: 1080 };
   const stillFrameMode = hasAvatar && (controls.mode === "manual" || !controls.playing);
-  const srWarmup = state?.animeSrCache?.warmup;
-  const srWarmupVersion = srWarmup?.active
-    ? "warming"
-    : `${Number(srWarmup?.processedFrames ?? 0)}-${Number(state?.animeSrCache?.cached ?? 0)}-${Number(srWarmup?.completedAt ?? 0)}`;
   const stillFramePath = state?.renderer === "panic3d" ? "frame.webp" : "frame.jpg";
   const useStillFrame = stillFrameMode && state?.renderer !== "panic3d";
-  const renderImageUrl = useStillFrame
-    ? `${API_BASE}/api/${stillFramePath}?width=${liveStreamSize.width}&height=${liveStreamSize.height}&v=${frameVersion}&sr=${srWarmupVersion}`
-    : `${API_BASE}/api/stream.mjpg?width=${liveStreamSize.width}&height=${liveStreamSize.height}`;
+  const anime4kEnabled = state?.renderer === "panic3d" && controls.anime4k;
+  const renderImageUrl = anime4kEnabled
+    ? `${API_BASE}/api/anime4k-source.mjpg`
+    : useStillFrame
+      ? `${API_BASE}/api/${stillFramePath}?width=${liveStreamSize.width}&height=${liveStreamSize.height}&v=${frameVersion}`
+      : `${API_BASE}/api/stream.mjpg?width=${liveStreamSize.width}&height=${liveStreamSize.height}`;
   const displayAvatar = loadedAvatar ?? selectedInput?.avatarName ?? "No avatar loaded";
   const currentIndex = steps.findIndex((step) => step.id === activeStep);
 
@@ -517,10 +518,12 @@ function App() {
           {hasAvatar && viewportMode === "splat" && exportedPly ? (
             <GaussianSplatStage url={exportedPly} />
           ) : hasAvatar ? (
-            <img
-              className="renderStream"
+            <Anime4KCanvas
               src={renderImageUrl}
               alt="Avatar live render"
+              enabled={anime4kEnabled}
+              camera={controls.camera}
+              outputSize={liveStreamSize}
             />
           ) : (
             <StagePlaceholder selectedPreview={selectedPreview} isBusy={isBusy} />
@@ -534,9 +537,6 @@ function App() {
           <Metric label="Render FPS" value={hasAvatar ? (state?.renderFps ?? "-") : "-"} />
           <Metric label="Animation FPS" value={hasAvatar ? (state?.animationFps ?? "-") : "-"} />
           <Metric label="Mode" value={hasAvatar ? (state?.mode ?? "default") : "-"} />
-          {state?.renderer === "panic3d" && (
-            <Metric label="SR prepass" value={formatSrProgress(state?.animeSrCache)} />
-          )}
           <Metric label="Webcam" value={hasAvatar && state?.webcamReady ? "Driving" : "Standby"} />
           {exportedPly && <a href={exportedPly}>Open exported PLY</a>}
         </div>
@@ -568,8 +568,6 @@ function App() {
             hasAvatar={hasAvatar}
             renderer={state?.renderer}
             animeExpressionHandler={state?.animeExpressionHandler}
-            animeSuperResolution={state?.animeSuperResolution}
-            animeSrCache={state?.animeSrCache}
           />
         )}
         {activeStep === "webcam" && (
@@ -662,14 +660,6 @@ function Metric({ label, value }) {
   );
 }
 
-function formatSrProgress(animeSrCache) {
-  const warmup = animeSrCache?.warmup;
-  const total = Number(warmup?.totalFrames ?? 0);
-  const processed = Number(warmup?.processedFrames ?? 0);
-  if (!total) return "Idle";
-  return `${Math.min(processed, total)}/${total}`;
-}
-
 function InputStep({ avatars, selectedPreview, selectedInput, onFileChange, onLoadAvatar }) {
   return (
     <div className="stepPane">
@@ -712,7 +702,7 @@ function GenerateStep({ selectedInput, isBusy, onGenerate }) {
   );
 }
 
-function PreviewStep({ controls, setControls, hasAvatar, renderer, animeExpressionHandler, animeSuperResolution, animeSrCache }) {
+function PreviewStep({ controls, setControls, hasAvatar, renderer, animeExpressionHandler }) {
   const isPanic = renderer === "panic3d";
   const activeExpressionControls = isPanic ? panicExpressionControls : expressionControls.map((label, index) => ({
     label,
@@ -721,18 +711,6 @@ function PreviewStep({ controls, setControls, hasAvatar, renderer, animeExpressi
     max: 2,
   }));
   const activeCameraControls = isPanic ? panicCameraControls : flexCameraControls;
-  const srLabel = animeSuperResolution === "real-cugan"
-    ? " + Real-CUGAN SR"
-    : animeSuperResolution === "real-esrgan"
-      ? " + Real-ESRGAN SR"
-      : animeSuperResolution === "adore"
-        ? " + Adore SR"
-        : "";
-  const srWarmup = animeSrCache?.warmup;
-  const srTotal = Number(srWarmup?.totalFrames ?? 0);
-  const srProcessed = Math.min(Number(srWarmup?.processedFrames ?? 0), srTotal);
-  const srPercent = srTotal ? Math.min(100, Math.max(0, Number(srWarmup?.percent ?? (srProcessed / srTotal) * 100))) : 0;
-
   const setExpression = (index, value) => {
     setControls((current) => {
       const expression = normalizeExpression(current.expression);
@@ -757,19 +735,7 @@ function PreviewStep({ controls, setControls, hasAvatar, renderer, animeExpressi
           <Sparkles size={18} />
           <span>
             {animeExpressionHandler === "tha4" ? "THA4 anime expression handler" : "Anime adapter controls"}
-            {srLabel}
           </span>
-        </div>
-      )}
-      {hasAvatar && renderer === "panic3d" && srTotal > 0 && (
-        <div className="srProgress">
-          <div>
-            <span>{srWarmup?.label ?? "SR prepass"}</span>
-            <strong>{srProcessed}/{srTotal}</strong>
-          </div>
-          <div className="progressTrack" aria-label={`SR prepass ${srProcessed} of ${srTotal}`}>
-            <span style={{ width: `${srPercent}%` }} />
-          </div>
         </div>
       )}
       <div className="segmented">
@@ -800,6 +766,21 @@ function PreviewStep({ controls, setControls, hasAvatar, renderer, animeExpressi
           onClick={() => setControls((value) => ({ ...value, lockHead: !value.lockHead }))}
         />
       </div>
+
+      {isPanic && (
+        <section className="toggleGroup">
+          <label className="toggleOption">
+            <span>
+              <strong>Anime4K Fast 2x</strong>
+              <small>Native THA4 source, realtime WebGL scaler</small>
+            </span>
+            <button
+              className={controls.anime4k ? "switch on" : "switch"}
+              onClick={() => setControls((value) => ({ ...value, anime4k: !value.anime4k }))}
+            />
+          </label>
+        </section>
+      )}
 
       <section className="sliderGroup">
         <header>{isPanic ? "Anime adapter" : "Expression"}</header>

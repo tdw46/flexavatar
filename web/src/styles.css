@@ -230,6 +230,38 @@ button {
   object-fit: contain;
 }
 
+.anime4kStage {
+  position: relative;
+  z-index: 1;
+  width: 100%;
+  height: 100%;
+}
+
+.anime4kSource {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.anime4kCanvas {
+  object-fit: contain;
+}
+
+.anime4kBadge {
+  position: absolute;
+  right: 12px;
+  bottom: 12px;
+  padding: 6px 8px;
+  border: 1px solid rgba(12, 115, 126, 0.22);
+  border-radius: 6px;
+  background: rgba(244, 253, 252, 0.92);
+  color: #0b5863;
+  font-size: 11px;
+  font-weight: 750;
+}
+
 .splatStage {
   min-height: 100%;
 }
@@ -465,46 +497,6 @@ button {
   font-weight: 780;
 }
 
-.srProgress {
-  display: grid;
-  gap: 8px;
-  min-height: 58px;
-  padding: 11px 12px;
-  border: 1px solid rgba(54, 80, 88, 0.12);
-  border-radius: 8px;
-  background: #ffffff;
-}
-
-.srProgress > div:first-child {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  color: #365862;
-  font-size: 12px;
-  font-weight: 720;
-}
-
-.srProgress strong {
-  color: #073f49;
-  font-variant-numeric: tabular-nums;
-}
-
-.progressTrack {
-  height: 7px;
-  overflow: hidden;
-  border-radius: 999px;
-  background: #dbe9ec;
-}
-
-.progressTrack span {
-  display: block;
-  height: 100%;
-  border-radius: inherit;
-  background: #0c8998;
-  transition: width 180ms ease;
-}
-
 .generationCard h2 {
   margin: 0;
   font-size: 20px;
@@ -603,6 +595,38 @@ button {
 
 .switch.on::after {
   transform: translateX(20px);
+}
+
+.toggleGroup {
+  display: grid;
+  gap: 8px;
+  padding: 10px;
+  border: 1px solid rgba(54, 80, 88, 0.12);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.58);
+}
+
+.toggleOption {
+  display: grid;
+  grid-template-columns: 1fr 48px;
+  align-items: center;
+  gap: 10px;
+}
+
+.toggleOption strong,
+.toggleOption small {
+  display: block;
+}
+
+.toggleOption strong {
+  color: #143943;
+  font-size: 12px;
+}
+
+.toggleOption small {
+  color: #60727a;
+  font-size: 11px;
+  line-height: 1.35;
 }
 
 .sliderGroup {
