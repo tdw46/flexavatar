@@ -498,10 +498,10 @@ class PanicAnimeBackend:
             phase_start = time.perf_counter()
             base = self._render_tha4_expression(asset, driver_expression, yaw, pitch, roll, wave)
             marks["tha4_render_ms"] = round((time.perf_counter() - phase_start) * 1000.0, 2)
+            self._update_anime4k_source(base)
             phase_start = time.perf_counter()
             base = self._crop_to_alpha(base, padding=26)
             marks["crop_ms"] = round((time.perf_counter() - phase_start) * 1000.0, 2)
-            self._update_anime4k_source(base)
             marks["source"] = "tha4-live"
             yaw = 0.0
             pitch = 0.0

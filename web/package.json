@@ -13,6 +13,7 @@
     "@mkkellogg/gaussian-splats-3d": "^0.4.7",
     "@vitejs/plugin-react": "^4.7.0",
     "anime4k": "^1.0.1",
+    "anime4k-webgpu": "^1.0.0",
     "lucide-react": "^0.561.0",
     "react": "^19.2.3",
     "react-dom": "^19.2.3",
