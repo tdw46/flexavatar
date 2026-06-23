@@ -771,8 +771,8 @@ function PreviewStep({ controls, setControls, hasAvatar, renderer, animeExpressi
         <section className="toggleGroup">
           <label className="toggleOption">
             <span>
-              <strong>Anime4K Fast 2x</strong>
-              <small>Native THA4 source, realtime WebGL scaler</small>
+              <strong>Anime4K Fast 4x</strong>
+              <small>Native THA4 source, realtime WebGPU restore + scaler</small>
             </span>
             <button
               className={controls.anime4k ? "switch on" : "switch"}

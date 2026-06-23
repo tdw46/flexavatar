@@ -2,7 +2,7 @@ import React from "react";
 import Anime4K from "anime4k";
 import * as Anime4KWebGPU from "anime4k-webgpu";
 
-const TARGET_SCALE = 2;
+const TARGET_SCALE = 4;
 const ANIME4K_OPTIONS = { blur: 4.0, bold: 7.5 };
 const THA4_DISPLAY_PADDING = 26;
 
@@ -118,11 +118,23 @@ async function renderAnime4KWebGpu(upscaledCanvas, sourceCanvas) {
     video,
     canvas: upscaledCanvas,
     pipelineBuilder: (device, inputTexture) => {
-      const upscale = new Anime4KWebGPU.CNNx2M({
+      const clamp = new Anime4KWebGPU.ClampHighlights({
         device,
         inputTexture,
       });
-      return [upscale];
+      const restore = new Anime4KWebGPU.CNNM({
+        device,
+        inputTexture: clamp.getOutputTexture(),
+      });
+      const firstUpscale = new Anime4KWebGPU.CNNx2M({
+        device,
+        inputTexture: restore.getOutputTexture(),
+      });
+      const secondUpscale = new Anime4KWebGPU.CNNx2M({
+        device,
+        inputTexture: firstUpscale.getOutputTexture(),
+      });
+      return [clamp, restore, firstUpscale, secondUpscale];
     },
   });
 
