@@ -325,6 +325,8 @@ button {
   flex-direction: column;
   min-width: 0;
   min-height: 0;
+  height: 100vh;
+  max-height: 100vh;
   overflow: hidden;
   padding: 26px 22px;
   border-left: 1px solid rgba(54, 80, 88, 0.14);
@@ -366,7 +368,9 @@ button {
   margin-top: 22px;
   min-height: 0;
   overflow: auto;
-  padding-right: 4px;
+  overscroll-behavior: contain;
+  padding: 0 4px 32px 0;
+  scrollbar-gutter: stable;
 }
 
 .dropzone {
@@ -459,6 +463,46 @@ button {
   background: #ecf8fa;
   font-size: 12px;
   font-weight: 780;
+}
+
+.srProgress {
+  display: grid;
+  gap: 8px;
+  min-height: 58px;
+  padding: 11px 12px;
+  border: 1px solid rgba(54, 80, 88, 0.12);
+  border-radius: 8px;
+  background: #ffffff;
+}
+
+.srProgress > div:first-child {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  color: #365862;
+  font-size: 12px;
+  font-weight: 720;
+}
+
+.srProgress strong {
+  color: #073f49;
+  font-variant-numeric: tabular-nums;
+}
+
+.progressTrack {
+  height: 7px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: #dbe9ec;
+}
+
+.progressTrack span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: #0c8998;
+  transition: width 180ms ease;
 }
 
 .generationCard h2 {
@@ -676,6 +720,8 @@ button {
   }
 
   .inspector {
+    height: auto;
+    max-height: none;
     border-left: 0;
     border-top: 1px solid rgba(54, 80, 88, 0.14);
   }

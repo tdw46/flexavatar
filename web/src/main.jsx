@@ -74,10 +74,10 @@ const flexCameraControls = [
 ];
 
 const panicCameraControls = [
-  { key: "yaw", label: "face turn", min: -32, max: 32 },
-  { key: "pitch", label: "face nod", min: -24, max: 24 },
-  { key: "roll", label: "tilt", min: -18, max: 18 },
-  { key: "radius", label: "zoom", min: 0.35, max: 1.65 },
+  { key: "yaw", label: "face turn", min: -32, max: 32, step: 4 },
+  { key: "pitch", label: "face nod", min: -24, max: 24, step: 4 },
+  { key: "roll", label: "tilt", min: -18, max: 18, step: 3 },
+  { key: "radius", label: "zoom", min: 0.35, max: 1.65, step: 0.1 },
 ];
 
 const normalizeExpression = (expression, length = 32) =>
@@ -117,8 +117,10 @@ function App() {
   const [exportedPly, setExportedPly] = React.useState(null);
   const [viewportMode, setViewportMode] = React.useState("live");
   const [notice, setNotice] = React.useState("");
+  const [frameVersion, setFrameVersion] = React.useState(0);
   const videoRef = React.useRef(null);
   const driveTimer = React.useRef(null);
+  const lastBackendControlSignature = React.useRef("");
 
   const pushControls = React.useCallback(async (nextControls) => {
     try {
@@ -138,6 +140,7 @@ function App() {
       if (result.state) {
         setState(result.state);
       }
+      setFrameVersion((value) => value + 1);
     } catch (error) {
       setNotice(error.message);
     }
@@ -205,8 +208,20 @@ function App() {
 
   React.useEffect(() => {
     if (!loadedAvatar) return;
+    const backendSignature = JSON.stringify({
+      renderer: state?.renderer ?? "",
+      mode: controls.mode,
+      playing: controls.playing,
+      lockHead: controls.lockHead,
+      expression: normalizeExpression(controls.expression),
+      jaw: controls.jaw,
+      head: controls.head,
+      camera: controls.camera,
+    });
+    if (lastBackendControlSignature.current === backendSignature) return;
+    lastBackendControlSignature.current = backendSignature;
     pushControls(controls);
-  }, [controls, loadedAvatar, pushControls]);
+  }, [controls, loadedAvatar, pushControls, state?.renderer]);
 
   React.useEffect(() => {
     if (!generationPending || !state?.lastError) return;
@@ -214,6 +229,19 @@ function App() {
     setNotice(`Generation failed: ${state.lastError}`);
     setActiveStep("generate");
   }, [generationPending, state?.lastError]);
+
+  React.useEffect(() => {
+    if (loadedAvatar || state?.busy || !state?.lastGeneratedAvatar) return;
+    if (state.currentAvatar !== state.lastGeneratedAvatar || !state.rendererReady) return;
+    setLoadedAvatar(state.currentAvatar);
+    setSelectedInput(null);
+    setSelectedPreview(null);
+    setViewportMode("live");
+    if (state.renderer === "panic3d") {
+      setControls((current) => ({ ...current, mode: "manual" }));
+    }
+    setActiveStep("preview");
+  }, [loadedAvatar, state?.busy, state?.currentAvatar, state?.lastGeneratedAvatar, state?.renderer, state?.rendererReady]);
 
   React.useEffect(() => {
     if (!webcamOn) {
@@ -312,6 +340,7 @@ function App() {
 
   async function generateSelected() {
     if (!selectedInput) return;
+    lastBackendControlSignature.current = "";
     setState((current) =>
       current
         ? {
@@ -350,6 +379,7 @@ function App() {
   }
 
   async function loadAvatar(name) {
+    lastBackendControlSignature.current = "";
     await api(`/api/load/${name}`, { method: "POST" });
     setLoadedAvatar(name);
     setSelectedInput(null);
@@ -365,6 +395,15 @@ function App() {
   const hasSplat = Boolean(hasAvatar && state?.hasSplat);
   const rendererLabel = state?.rendererLabel ?? "FlexAvatar Gaussian";
   const liveStreamSize = state?.renderer === "panic3d" ? { width: 1600, height: 1600 } : { width: 1920, height: 1080 };
+  const stillFrameMode = hasAvatar && (controls.mode === "manual" || !controls.playing);
+  const srWarmup = state?.animeSrCache?.warmup;
+  const srWarmupVersion = srWarmup?.active
+    ? "warming"
+    : `${Number(srWarmup?.processedFrames ?? 0)}-${Number(state?.animeSrCache?.cached ?? 0)}-${Number(srWarmup?.completedAt ?? 0)}`;
+  const stillFramePath = state?.renderer === "panic3d" ? "frame.webp" : "frame.jpg";
+  const renderImageUrl = stillFrameMode
+    ? `${API_BASE}/api/${stillFramePath}?width=${liveStreamSize.width}&height=${liveStreamSize.height}&v=${frameVersion}&sr=${srWarmupVersion}`
+    : `${API_BASE}/api/stream.mjpg?width=${liveStreamSize.width}&height=${liveStreamSize.height}`;
   const displayAvatar = loadedAvatar ?? selectedInput?.avatarName ?? "No avatar loaded";
   const currentIndex = steps.findIndex((step) => step.id === activeStep);
 
@@ -444,7 +483,7 @@ function App() {
           ) : hasAvatar ? (
             <img
               className="renderStream"
-              src={`${API_BASE}/api/stream.mjpg?width=${liveStreamSize.width}&height=${liveStreamSize.height}`}
+              src={renderImageUrl}
               alt="Avatar live render"
             />
           ) : (
@@ -459,6 +498,9 @@ function App() {
           <Metric label="Render FPS" value={hasAvatar ? (state?.renderFps ?? "-") : "-"} />
           <Metric label="Animation FPS" value={hasAvatar ? (state?.animationFps ?? "-") : "-"} />
           <Metric label="Mode" value={hasAvatar ? (state?.mode ?? "default") : "-"} />
+          {state?.renderer === "panic3d" && (
+            <Metric label="SR prepass" value={formatSrProgress(state?.animeSrCache)} />
+          )}
           <Metric label="Webcam" value={hasAvatar && state?.webcamReady ? "Driving" : "Standby"} />
           {exportedPly && <a href={exportedPly}>Open exported PLY</a>}
         </div>
@@ -491,6 +533,7 @@ function App() {
             renderer={state?.renderer}
             animeExpressionHandler={state?.animeExpressionHandler}
             animeSuperResolution={state?.animeSuperResolution}
+            animeSrCache={state?.animeSrCache}
           />
         )}
         {activeStep === "webcam" && (
@@ -583,6 +626,14 @@ function Metric({ label, value }) {
   );
 }
 
+function formatSrProgress(animeSrCache) {
+  const warmup = animeSrCache?.warmup;
+  const total = Number(warmup?.totalFrames ?? 0);
+  const processed = Number(warmup?.processedFrames ?? 0);
+  if (!total) return "Idle";
+  return `${Math.min(processed, total)}/${total}`;
+}
+
 function InputStep({ avatars, selectedPreview, selectedInput, onFileChange, onLoadAvatar }) {
   return (
     <div className="stepPane">
@@ -625,7 +676,7 @@ function GenerateStep({ selectedInput, isBusy, onGenerate }) {
   );
 }
 
-function PreviewStep({ controls, setControls, hasAvatar, renderer, animeExpressionHandler, animeSuperResolution }) {
+function PreviewStep({ controls, setControls, hasAvatar, renderer, animeExpressionHandler, animeSuperResolution, animeSrCache }) {
   const isPanic = renderer === "panic3d";
   const activeExpressionControls = isPanic ? panicExpressionControls : expressionControls.map((label, index) => ({
     label,
@@ -638,7 +689,13 @@ function PreviewStep({ controls, setControls, hasAvatar, renderer, animeExpressi
     ? " + Real-CUGAN SR"
     : animeSuperResolution === "real-esrgan"
       ? " + Real-ESRGAN SR"
-      : "";
+      : animeSuperResolution === "adore"
+        ? " + Adore SR"
+        : "";
+  const srWarmup = animeSrCache?.warmup;
+  const srTotal = Number(srWarmup?.totalFrames ?? 0);
+  const srProcessed = Math.min(Number(srWarmup?.processedFrames ?? 0), srTotal);
+  const srPercent = srTotal ? Math.min(100, Math.max(0, Number(srWarmup?.percent ?? (srProcessed / srTotal) * 100))) : 0;
 
   const setExpression = (index, value) => {
     setControls((current) => {
@@ -662,6 +719,17 @@ function PreviewStep({ controls, setControls, hasAvatar, renderer, animeExpressi
             {animeExpressionHandler === "tha4" ? "THA4 anime expression handler" : "Anime adapter controls"}
             {srLabel}
           </span>
+        </div>
+      )}
+      {hasAvatar && renderer === "panic3d" && srTotal > 0 && (
+        <div className="srProgress">
+          <div>
+            <span>{srWarmup?.label ?? "SR prepass"}</span>
+            <strong>{srProcessed}/{srTotal}</strong>
+          </div>
+          <div className="progressTrack" aria-label={`SR prepass ${srProcessed} of ${srTotal}`}>
+            <span style={{ width: `${srPercent}%` }} />
+          </div>
         </div>
       )}
       <div className="segmented">
@@ -702,7 +770,7 @@ function PreviewStep({ controls, setControls, hasAvatar, renderer, animeExpressi
             value={controls.expression[control.index]}
             min={control.min}
             max={control.max}
-            step={0.01}
+            step={isPanic ? 0.25 : 0.01}
             onChange={(value) => setExpression(control.index, value)}
           />
         ))}
@@ -717,7 +785,7 @@ function PreviewStep({ controls, setControls, hasAvatar, renderer, animeExpressi
             value={controls.camera[control.key]}
             min={control.min}
             max={control.max}
-            step={0.01}
+            step={isPanic ? control.step : 0.01}
             onChange={(value) =>
               setControls((current) => ({
                 ...current,
@@ -753,7 +821,7 @@ function Slider({ label, value, min, max, step, onChange }) {
   return (
     <label className="slider">
       <span>{label}</span>
-      <input type="range" min={min} max={max} step={step} value={value} onInput={handleInput} onChange={handleInput} />
+      <input type="range" min={min} max={max} step={step} value={value} onInput={handleInput} />
       <output>{Number(value).toFixed(2)}</output>
     </label>
   );
