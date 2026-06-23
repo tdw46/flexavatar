@@ -8,6 +8,7 @@ import sys
 import tempfile
 import time
 import traceback
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -211,6 +212,7 @@ class ControlPayload(BaseModel):
     mode: str = "default"
     playing: bool = True
     lock_head: bool = False
+    interacting: bool = False
     expression: list[float] = []
     jaw: list[float] = [0, 0, 0]
     head: list[float] = [0, 0, 0]
@@ -399,14 +401,18 @@ class AnimeSuperResolution:
                 return cached.copy()
         return None
 
+    def has_key(self, cache_key: str):
+        with self._lock:
+            return cache_key in self._cache or cache_key in self._pending
+
     def warm(self, image: Image.Image, cache_key: Optional[str] = None):
         source = image.convert("RGBA")
         key = cache_key or self._cache_key(source)
         with self._lock:
             if key in self._cache or key in self._pending:
-                return
+                return True
             self._pending.add(key)
-        self._upscale_worker(key, source.copy())
+        return self._upscale_worker(key, source.copy())
 
     def stats(self):
         with self._lock:
@@ -417,6 +423,7 @@ class AnimeSuperResolution:
             }
 
     def _upscale_worker(self, key: str, image: Image.Image):
+        completed = False
         try:
             result = self._upscale(image)
             with self._lock:
@@ -425,11 +432,13 @@ class AnimeSuperResolution:
                 while len(self._cache_order) > self.cache_limit:
                     old_key = self._cache_order.pop(0)
                     self._cache.pop(old_key, None)
+            completed = True
         except Exception:
             traceback.print_exc()
         finally:
             with self._lock:
                 self._pending.discard(key)
+        return completed
 
     def _upscale(self, image: Image.Image):
         resized = self._resize_for_model(image)
@@ -488,6 +497,10 @@ class AnimeSuperResolution:
         return max(minimum, min(maximum, float(value)))
 
 
+class AnimeSrPaused(RuntimeError):
+    pass
+
+
 class RealCuganSuperResolution:
     def __init__(
         self,
@@ -499,8 +512,9 @@ class RealCuganSuperResolution:
         tta: bool = False,
         tile_size: int = 0,
         syncgap: int = 3,
-        jobs: str = "1:2:2",
+        jobs: str = "1:1:1",
         cache_limit: int = 96,
+        pause_callback=None,
     ):
         self.executable_path = executable_path.resolve()
         self.model_dir = model_dir.resolve()
@@ -512,8 +526,11 @@ class RealCuganSuperResolution:
         self.syncgap = max(0, min(3, int(syncgap)))
         self.jobs = str(jobs)
         self.cache_limit = max(8, int(cache_limit))
+        self.pause_callback = pause_callback
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="anime-realcugan")
         self._lock = RLock()
+        self._upscale_lock = RLock()
+        self._last_upscale_finished_at = 0.0
         self._cache: dict[str, Image.Image] = {}
         self._pending: set[str] = set()
         self._cache_order: list[str] = []
@@ -546,14 +563,18 @@ class RealCuganSuperResolution:
                 return cached.copy()
         return None
 
+    def has_key(self, cache_key: str):
+        with self._lock:
+            return cache_key in self._cache or cache_key in self._pending
+
     def warm(self, image: Image.Image, cache_key: Optional[str] = None):
         source = image.convert("RGBA")
         key = cache_key or self._cache_key(source)
         with self._lock:
             if key in self._cache or key in self._pending:
-                return
+                return True
             self._pending.add(key)
-        self._upscale_worker(key, source.copy())
+        return self._upscale_worker(key, source.copy())
 
     def stats(self):
         with self._lock:
@@ -564,6 +585,7 @@ class RealCuganSuperResolution:
             }
 
     def _upscale_worker(self, key: str, image: Image.Image):
+        completed = False
         try:
             result = self._upscale(image)
             with self._lock:
@@ -572,64 +594,88 @@ class RealCuganSuperResolution:
                 while len(self._cache_order) > self.cache_limit:
                     old_key = self._cache_order.pop(0)
                     self._cache.pop(old_key, None)
+            completed = True
+        except AnimeSrPaused:
+            completed = False
         except Exception:
             traceback.print_exc()
         finally:
             with self._lock:
                 self._pending.discard(key)
+        return completed
 
     def _upscale(self, image: Image.Image):
-        resized = self._resize_for_model(image)
-        rgb_input = Image.new("RGBA", resized.size, (248, 252, 252, 255))
-        rgb_input.alpha_composite(resized)
+        with self._upscale_lock:
+            self._wait_if_paused()
+            min_interval = max(0.0, float(os.environ.get("FLEXAVATAR_REALCUGAN_MIN_INTERVAL_MS", "300")) / 1000.0)
+            elapsed = time.time() - self._last_upscale_finished_at
+            if elapsed < min_interval:
+                time.sleep(min_interval - elapsed)
+            self._wait_if_paused()
 
-        with tempfile.TemporaryDirectory(prefix="flexavatar-realcugan-") as tmp:
-            tmp_dir = Path(tmp)
-            input_path = tmp_dir / "input.png"
-            output_path = tmp_dir / "output.png"
-            rgb_input.convert("RGB").save(input_path)
-            model_dir_arg = str(self.model_dir)
-            try:
-                model_dir_arg = str(self.model_dir.relative_to(self.executable_path.parent))
-            except ValueError:
-                pass
-            command = [
-                str(self.executable_path),
-                "-i",
-                str(input_path),
-                "-o",
-                str(output_path),
-                "-s",
-                str(self.scale),
-                "-n",
-                str(self.denoise),
-                "-t",
-                str(self.tile_size),
-                "-c",
-                str(self.syncgap),
-                "-j",
-                self.jobs,
-                "-m",
-                model_dir_arg,
-                "-f",
-                "png",
-            ]
-            if self.tta:
-                command.append("-x")
-            completed = subprocess.run(
-                command,
-                cwd=str(self.executable_path.parent),
-                check=False,
-                capture_output=True,
-                text=True,
-            )
-            if completed.returncode != 0:
-                detail = (completed.stderr or completed.stdout or "Real-CUGAN failed").strip()
-                raise RuntimeError(detail)
-            rgb_image = Image.open(output_path).convert("RGB")
+            resized = self._resize_for_model(image)
+            rgb_input = Image.new("RGBA", resized.size, (248, 252, 252, 255))
+            rgb_input.alpha_composite(resized)
 
-        alpha = resized.getchannel("A").resize(rgb_image.size, Image.Resampling.LANCZOS)
-        return Image.merge("RGBA", (*rgb_image.split(), alpha))
+            with tempfile.TemporaryDirectory(prefix="flexavatar-realcugan-") as tmp:
+                tmp_dir = Path(tmp)
+                input_path = tmp_dir / "input.png"
+                output_path = tmp_dir / "output.png"
+                rgb_input.convert("RGB").save(input_path)
+                model_dir_arg = str(self.model_dir)
+                try:
+                    model_dir_arg = str(self.model_dir.relative_to(self.executable_path.parent))
+                except ValueError:
+                    pass
+                command = [
+                    str(self.executable_path),
+                    "-i",
+                    str(input_path),
+                    "-o",
+                    str(output_path),
+                    "-s",
+                    str(self.scale),
+                    "-n",
+                    str(self.denoise),
+                    "-t",
+                    str(self.tile_size),
+                    "-c",
+                    str(self.syncgap),
+                    "-j",
+                    self.jobs,
+                    "-m",
+                    model_dir_arg,
+                    "-f",
+                    "png",
+                ]
+                if self.tta:
+                    command.append("-x")
+                process = subprocess.Popen(
+                    command,
+                    cwd=str(self.executable_path.parent),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+                while process.poll() is None:
+                    if self._is_paused():
+                        process.terminate()
+                        try:
+                            process.wait(timeout=2)
+                        except subprocess.TimeoutExpired:
+                            process.kill()
+                            process.wait(timeout=2)
+                        raise AnimeSrPaused("Real-CUGAN paused for active slider interaction")
+                    time.sleep(0.05)
+                stdout, stderr = process.communicate()
+                self._last_upscale_finished_at = time.time()
+                if process.returncode != 0:
+                    detail = (stderr or stdout or "Real-CUGAN failed").strip()
+                    raise RuntimeError(detail)
+                rgb_image = Image.open(output_path).convert("RGB")
+
+            alpha = resized.getchannel("A").resize(rgb_image.size, Image.Resampling.LANCZOS)
+            return Image.merge("RGBA", (*rgb_image.split(), alpha))
 
     def _resize_for_model(self, image: Image.Image):
         width, height = image.size
@@ -639,6 +685,13 @@ class RealCuganSuperResolution:
         scale = self.max_input_side / longest
         next_size = (max(1, int(width * scale)), max(1, int(height * scale)))
         return image.resize(next_size, Image.Resampling.LANCZOS)
+
+    def _is_paused(self):
+        return bool(self.pause_callback and self.pause_callback())
+
+    def _wait_if_paused(self):
+        while self._is_paused():
+            time.sleep(0.05)
 
     def _cache_key(self, image: Image.Image):
         digest = hashlib.sha1()
@@ -694,11 +747,25 @@ class PanicAnimeBackend:
         self._sr_handler = None
         self._sr_warmup_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="anime-sr-warmup")
         self._sr_warmup_pending: set[str] = set()
+        self._sr_priority_warmups = deque()
+        self._sr_priority_worker_active = False
+        self._sr_interaction_held = False
+        self._sr_pause_until = 0.0
         self._sr_warmup_lock = RLock()
+        self._control_warmup_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="anime-control-warmup")
+        self._control_warmup_lock = RLock()
+        self._control_warmup_latest = None
+        self._control_warmup_active = False
+        self._timing_lock = RLock()
+        self._render_timings = deque(maxlen=240)
         self._final_frame_lock = RLock()
         self._final_frame_cache: dict[str, bytes] = {}
         self._final_frame_order: list[str] = []
         self._final_frame_cache_limit = max(32, int(os.environ.get("FLEXAVATAR_ANIME_FINAL_FRAME_CACHE_LIMIT", "320")))
+        self._live_base_lock = RLock()
+        self._live_base_cache: dict[str, Image.Image] = {}
+        self._live_base_order: list[str] = []
+        self._live_base_cache_limit = max(32, int(os.environ.get("FLEXAVATAR_ANIME_LIVE_BASE_CACHE_LIMIT", "512")))
         self._final_frame_disk_cache_enabled = os.environ.get("FLEXAVATAR_ANIME_DISK_FRAME_CACHE", "1") == "1"
         self._final_frame_disk_cache_dir = Path(os.environ.get(
             "FLEXAVATAR_ANIME_FINAL_FRAME_CACHE_DIR",
@@ -812,8 +879,20 @@ class PanicAnimeBackend:
             image_offset=offset,
             image_size=(image.width, image.height),
         )
+        self.prewarm_live_preview(asset)
         self.queue_slider_cache_warmup(asset)
         return asset
+
+    def prewarm_live_preview(self, asset: PanicAnimeAsset):
+        if not self.expression_handler_installed:
+            return
+        expression = [0.0] * 32
+        try:
+            image = self._render_tha4_expression(asset, expression, 0.0, 0.0, 0.0, 0.0)
+            image = self._crop_to_alpha(image, padding=26)
+            self._store_live_base(self._live_base_cache_key(asset, expression, 0.0, 0.0, 0.0, 0.0), image)
+        except Exception:
+            traceback.print_exc()
 
     def render_jpeg(
         self,
@@ -827,10 +906,13 @@ class PanicAnimeBackend:
         output_format: str = "JPEG",
     ):
         start = time.time()
+        marks = {"mode": str(controls.get("mode", "default"))}
+        phase_start = time.perf_counter()
         expression = controls.get("expression") or []
         head = controls.get("head") or [0, 0, 0]
         mode = controls.get("mode", "default")
         playing = bool(controls.get("playing", True))
+        interacting = bool(controls.get("interacting", False))
         animation_frame = int(time.time() * 30) % 360 if mode == "default" and playing else frame_index
 
         wave = np.sin(animation_frame / 18) if mode == "default" and playing else 0.0
@@ -842,9 +924,11 @@ class PanicAnimeBackend:
         final_cache_key = None
         should_super_resolve = self._should_super_resolve(mode, playing)
         super_resolved = not should_super_resolve
+        marks["setup_ms"] = round((time.perf_counter() - phase_start) * 1000.0, 2)
         if self.expression_handler_installed:
-            sr_key = self._sr_pose_cache_key(asset, driver_expression, yaw, pitch, roll, wave)
+            sr_key = None
             if should_super_resolve:
+                phase_start = time.perf_counter()
                 final_cache_key = self._final_frame_cache_key(
                     asset,
                     driver_expression,
@@ -858,16 +942,39 @@ class PanicAnimeBackend:
                     output_format,
                     quality,
                 )
-                cached_frame = self._get_final_frame(final_cache_key)
+                cached_frame = self._get_final_frame(final_cache_key, allow_disk=not interacting)
+                marks["final_cache_ms"] = round((time.perf_counter() - phase_start) * 1000.0, 2)
                 if cached_frame is not None:
+                    marks["source"] = "final-cache"
+                    self._record_render_timing(start, width, height, output_format, quality, marks)
                     return cached_frame, int(1 / max(time.time() - start, 1e-6))
-            base = self._cached_super_resolve_by_key(sr_key) if should_super_resolve else None
+            if should_super_resolve and not interacting:
+                phase_start = time.perf_counter()
+                sr_key = self._sr_pose_cache_key(asset, driver_expression, yaw, pitch, roll, wave)
+                marks["sr_key_ms"] = round((time.perf_counter() - phase_start) * 1000.0, 2)
+            phase_start = time.perf_counter()
+            base = self._cached_super_resolve_by_key(sr_key) if sr_key is not None else None
+            marks["sr_cache_ms"] = round((time.perf_counter() - phase_start) * 1000.0, 2)
             super_resolved = base is not None if should_super_resolve else True
             if base is None:
-                base = self._render_tha4_expression(asset, driver_expression, yaw, pitch, roll, wave)
-                base = self._crop_to_alpha(base, padding=26)
-            if should_super_resolve and not super_resolved:
-                base, super_resolved = self._super_resolve(base, sr_key)
+                live_base_key = self._live_base_cache_key(asset, driver_expression, yaw, pitch, roll, wave)
+                phase_start = time.perf_counter()
+                base = self._get_live_base(live_base_key) if mode == "manual" else None
+                marks["live_base_cache_ms"] = round((time.perf_counter() - phase_start) * 1000.0, 2)
+                if base is None:
+                    phase_start = time.perf_counter()
+                    base = self._render_tha4_expression(asset, driver_expression, yaw, pitch, roll, wave)
+                    marks["tha4_render_ms"] = round((time.perf_counter() - phase_start) * 1000.0, 2)
+                    phase_start = time.perf_counter()
+                    base = self._crop_to_alpha(base, padding=26)
+                    marks["crop_ms"] = round((time.perf_counter() - phase_start) * 1000.0, 2)
+                    if mode == "manual":
+                        self._store_live_base(live_base_key, base)
+                    marks["source"] = "tha4-live"
+                else:
+                    marks["source"] = "live-base-cache"
+            else:
+                marks["source"] = "sr-cache"
             yaw = 0.0
             pitch = 0.0
             roll = 0.0
@@ -883,7 +990,7 @@ class PanicAnimeBackend:
         target_w = max(96, int(width * min(max_fill, scale)))
         target_h = max(96, int(height * min(max_fill, scale)))
         image = ImageOps.contain(base, (target_w, target_h), Image.Resampling.LANCZOS)
-        if self.expression_handler_installed:
+        if self.expression_handler_installed and (super_resolved or not interacting):
             image = self._enhance_anime_display(image)
         image = image.rotate(roll * 0.32, resample=Image.Resampling.BICUBIC, expand=True)
 
@@ -892,9 +999,12 @@ class PanicAnimeBackend:
         y = int((height - image.height) / 2 - self._clamp(pitch / 40, -1.0, 1.0) * height * 0.028)
         canvas.alpha_composite(image, (x, y))
 
+        phase_start = time.perf_counter()
         payload = self._encode_frame(canvas, output_format, quality)
+        marks["encode_ms"] = round((time.perf_counter() - phase_start) * 1000.0, 2)
         if final_cache_key is not None and super_resolved:
             self._store_final_frame(final_cache_key, payload, output_format)
+        self._record_render_timing(start, width, height, output_format, quality, marks)
         return payload, int(1 / max(time.time() - start, 1e-6))
 
     def _compose_final_frame(
@@ -963,7 +1073,7 @@ class PanicAnimeBackend:
         digest.update(os.environ.get("FLEXAVATAR_REALCUGAN_TTA", "1").encode("ascii"))
         digest.update(os.environ.get("FLEXAVATAR_REALCUGAN_TILE", "0").encode("ascii"))
         digest.update(os.environ.get("FLEXAVATAR_REALCUGAN_SYNCGAP", "3").encode("ascii"))
-        digest.update(os.environ.get("FLEXAVATAR_REALCUGAN_JOBS", "1:2:2").encode("ascii"))
+        digest.update(os.environ.get("FLEXAVATAR_REALCUGAN_JOBS", "1:1:1").encode("ascii"))
         digest.update(str([round(float(value), 3) for value in expression[:32]]).encode("ascii"))
         digest.update(f"{yaw:.3f}:{pitch:.3f}:{roll:.3f}:{wave:.3f}".encode("ascii"))
         digest.update(f"{width}:{height}:{radius:.3f}:{output_format.upper()}:{quality}".encode("ascii"))
@@ -971,11 +1081,13 @@ class PanicAnimeBackend:
         digest.update(os.environ.get("FLEXAVATAR_ANIME_WEBP_LOSSLESS", "0").encode("ascii"))
         return digest.hexdigest()
 
-    def _get_final_frame(self, cache_key: str):
+    def _get_final_frame(self, cache_key: str, allow_disk: bool = True):
         with self._final_frame_lock:
             cached = self._final_frame_cache.get(cache_key)
         if cached is not None:
             return cached
+        if not allow_disk:
+            return None
         disk_path = self._final_frame_disk_cache_path(cache_key, "WEBP")
         if disk_path is not None and disk_path.exists():
             try:
@@ -1000,6 +1112,39 @@ class PanicAnimeBackend:
                 disk_path.write_bytes(payload)
             except OSError:
                 traceback.print_exc()
+
+    def _live_base_cache_key(
+        self,
+        asset: PanicAnimeAsset,
+        expression: list[float],
+        yaw: float,
+        pitch: float,
+        roll: float,
+        wave: float,
+    ):
+        digest = hashlib.sha1()
+        digest.update(asset.name.encode("utf-8"))
+        digest.update(str(asset.tha4_image_path).encode("utf-8"))
+        digest.update(str(asset.tha4_image_path.stat().st_mtime_ns).encode("ascii"))
+        digest.update(str([round(float(value), 3) for value in expression[:32]]).encode("ascii"))
+        digest.update(f"{yaw:.3f}:{pitch:.3f}:{roll:.3f}:{wave:.3f}".encode("ascii"))
+        return digest.hexdigest()
+
+    def _get_live_base(self, cache_key: str):
+        with self._live_base_lock:
+            cached = self._live_base_cache.get(cache_key)
+            if cached is not None:
+                return cached.copy()
+        return None
+
+    def _store_live_base(self, cache_key: str, image: Image.Image):
+        with self._live_base_lock:
+            if cache_key not in self._live_base_cache:
+                self._live_base_order.append(cache_key)
+            self._live_base_cache[cache_key] = image.copy()
+            while len(self._live_base_order) > self._live_base_cache_limit:
+                old_key = self._live_base_order.pop(0)
+                self._live_base_cache.pop(old_key, None)
 
     def _final_frame_disk_cache_path(self, cache_key: str, output_format: str):
         if not self._final_frame_disk_cache_enabled or output_format.upper() != "WEBP":
@@ -1048,6 +1193,11 @@ class PanicAnimeBackend:
             return None
         return self._sr_handler.cached_by_key(cache_key)
 
+    def _has_super_resolve_by_key(self, cache_key: str):
+        if self._sr_handler is None:
+            return False
+        return self._sr_handler.has_key(cache_key)
+
     def _get_sr_handler(self):
         if self._sr_handler is None:
             cache_limit = int(os.environ.get("FLEXAVATAR_ANIME_SR_CACHE_LIMIT", "256"))
@@ -1061,7 +1211,7 @@ class PanicAnimeBackend:
                 tta = os.environ.get("FLEXAVATAR_REALCUGAN_TTA", "1") == "1"
                 tile_size = int(os.environ.get("FLEXAVATAR_REALCUGAN_TILE", "0"))
                 syncgap = int(os.environ.get("FLEXAVATAR_REALCUGAN_SYNCGAP", "3"))
-                jobs = os.environ.get("FLEXAVATAR_REALCUGAN_JOBS", "1:2:2")
+                jobs = os.environ.get("FLEXAVATAR_REALCUGAN_JOBS", "1:1:1")
                 self._sr_handler = RealCuganSuperResolution(
                     self.realcugan_executable,
                     self.realcugan_model_dir,
@@ -1073,6 +1223,7 @@ class PanicAnimeBackend:
                     syncgap=syncgap,
                     jobs=jobs,
                     cache_limit=cache_limit,
+                    pause_callback=self._sr_interaction_active,
                 )
             elif backend == "adore" and self.adore_model_path.exists():
                 max_side = int(os.environ.get("FLEXAVATAR_ANIME_SR_INPUT", "512"))
@@ -1084,7 +1235,7 @@ class PanicAnimeBackend:
                 tta = os.environ.get("FLEXAVATAR_REALCUGAN_TTA", "1") == "1"
                 tile_size = int(os.environ.get("FLEXAVATAR_REALCUGAN_TILE", "0"))
                 syncgap = int(os.environ.get("FLEXAVATAR_REALCUGAN_SYNCGAP", "3"))
-                jobs = os.environ.get("FLEXAVATAR_REALCUGAN_JOBS", "1:2:2")
+                jobs = os.environ.get("FLEXAVATAR_REALCUGAN_JOBS", "1:1:1")
                 self._sr_handler = RealCuganSuperResolution(
                     self.realcugan_executable,
                     self.realcugan_model_dir,
@@ -1096,6 +1247,7 @@ class PanicAnimeBackend:
                     syncgap=syncgap,
                     jobs=jobs,
                     cache_limit=cache_limit,
+                    pause_callback=self._sr_interaction_active,
                 )
             elif self.adore_model_path.exists():
                 max_side = int(os.environ.get("FLEXAVATAR_ANIME_SR_INPUT", "512"))
@@ -1104,6 +1256,58 @@ class PanicAnimeBackend:
                 max_side = int(os.environ.get("FLEXAVATAR_ANIME_SR_INPUT", "256"))
                 self._sr_handler = AnimeSuperResolution(self.sr_model_path, max_input_side=max_side, cache_limit=cache_limit)
         return self._sr_handler
+
+    def _record_render_timing(
+        self,
+        start_time: float,
+        width: int,
+        height: int,
+        output_format: str,
+        quality: int,
+        marks: dict,
+    ):
+        entry = {
+            "ts": time.time(),
+            "totalMs": round((time.time() - start_time) * 1000.0, 2),
+            "width": width,
+            "height": height,
+            "format": output_format.upper(),
+            "quality": quality,
+            **marks,
+        }
+        with self._timing_lock:
+            self._render_timings.append(entry)
+
+    def render_timing_stats(self):
+        with self._timing_lock:
+            timings = list(self._render_timings)
+        if not timings:
+            return {"count": 0, "recent": []}
+        by_mode = {}
+        by_source = {}
+        for entry in timings:
+            mode = entry.get("mode") or "unknown"
+            source = entry.get("source") or "unknown"
+            by_mode.setdefault(mode, []).append(float(entry.get("totalMs") or 0.0))
+            by_source.setdefault(source, []).append(float(entry.get("totalMs") or 0.0))
+
+        def summarize(values):
+            ordered = sorted(values)
+            count = len(ordered)
+            return {
+                "count": count,
+                "avgMs": round(sum(ordered) / max(1, count), 2),
+                "p50Ms": round(ordered[count // 2], 2),
+                "p95Ms": round(ordered[min(count - 1, int(count * 0.95))], 2),
+                "maxMs": round(ordered[-1], 2),
+            }
+
+        return {
+            "count": len(timings),
+            "byMode": {mode: summarize(values) for mode, values in by_mode.items()},
+            "bySource": {source: summarize(values) for source, values in by_source.items()},
+            "recent": timings[-30:],
+        }
 
     def queue_slider_cache_warmup(self, asset: PanicAnimeAsset):
         if os.environ.get("FLEXAVATAR_DISABLE_ANIME_SR_PREWARM") == "1":
@@ -1142,20 +1346,82 @@ class PanicAnimeBackend:
         yaw = camera.yaw + float(head[1] if len(head) > 1 else 0)
         pitch = camera.pitch + float(head[0] if len(head) > 0 else 0)
         roll = camera.roll + float(head[2] if len(head) > 2 else 0)
-        pose_key = self._warmup_pose_key(asset, driver_expression, yaw, pitch, roll, frame_index)
+        self.queue_priority_pose_warmup(asset, driver_expression, yaw, pitch, roll, 0.0)
+
+    def schedule_current_pose_warmup(self, asset: PanicAnimeAsset, camera: WebCamera, controls: dict, frame_index: int):
+        with self._control_warmup_lock:
+            self._control_warmup_latest = (asset, camera, controls, frame_index)
+            if self._control_warmup_active:
+                return
+            self._control_warmup_active = True
+        self._control_warmup_executor.submit(self._control_warmup_worker)
+
+    def _control_warmup_worker(self):
+        try:
+            while True:
+                with self._control_warmup_lock:
+                    item = self._control_warmup_latest
+                    self._control_warmup_latest = None
+                if item is None:
+                    return
+                try:
+                    self.warm_current_pose(*item)
+                except Exception:
+                    traceback.print_exc()
+        finally:
+            with self._control_warmup_lock:
+                self._control_warmup_active = False
+                should_restart = self._control_warmup_latest is not None
+                if should_restart:
+                    self._control_warmup_active = True
+            if should_restart:
+                self._control_warmup_executor.submit(self._control_warmup_worker)
+
+    def note_control_interaction(self, active: bool = False):
+        pause_seconds = max(0.0, float(os.environ.get("FLEXAVATAR_ANIME_SR_INTERACTION_DEBOUNCE_MS", "350")) / 1000.0)
+        with self._sr_warmup_lock:
+            self._sr_interaction_held = bool(active)
+            if active:
+                self._sr_pause_until = max(self._sr_pause_until, time.time() + pause_seconds)
+            else:
+                self._sr_pause_until = max(self._sr_pause_until, time.time() + pause_seconds)
+
+    def queue_priority_pose_warmup(
+        self,
+        asset: PanicAnimeAsset,
+        expression: list[float],
+        yaw: float,
+        pitch: float,
+        roll: float,
+        wave: float,
+    ):
+        if os.environ.get("FLEXAVATAR_DISABLE_ANIME_SR_PREWARM") == "1":
+            return
+        if not self.super_resolution_installed or not self.expression_handler_installed:
+            return
+        active_expression_count = sum(1 for value in expression[:32] if abs(float(value)) > 1e-3)
+        active_pose_count = sum(1 for value in (yaw, pitch, roll) if abs(float(value)) > 1e-3)
+        is_single_expression_only = active_expression_count <= 1 and active_pose_count == 0
+        is_single_pose_only = active_expression_count == 0 and active_pose_count <= 1
+        if is_single_expression_only or is_single_pose_only:
+            return
+        cache_key = self._sr_pose_cache_key(asset, expression, yaw, pitch, roll, wave)
+        if self._has_super_resolve_by_key(cache_key):
+            return
+        pose_key = self._warmup_pose_key(asset, expression, yaw, pitch, roll, 0)
         with self._sr_warmup_lock:
             if pose_key in self._sr_warmup_pending:
                 return
             self._sr_warmup_pending.add(pose_key)
+            for queued_pose in self._sr_priority_warmups:
+                self._sr_warmup_pending.discard(queued_pose[0])
+            self._sr_priority_warmups.clear()
+            self._sr_priority_warmups.append((pose_key, asset, expression, yaw, pitch, roll, wave))
+            if self._sr_warmup_progress.get("active") or self._sr_priority_worker_active:
+                return
+            self._sr_priority_worker_active = True
         self._sr_warmup_executor.submit(
-            self._warm_single_pose_worker,
-            pose_key,
-            asset,
-            driver_expression,
-            yaw,
-            pitch,
-            roll,
-            0.0,
+            self._priority_warmup_worker,
         )
 
     def sr_stats(self):
@@ -1171,19 +1437,32 @@ class PanicAnimeBackend:
 
     def _warm_slider_cache_worker(self, warmup_key: str, asset: PanicAnimeAsset, poses: list[tuple[list[float], float, float, float]]):
         try:
-            for frame_number, (expression, yaw, pitch, roll) in enumerate(poses, start=1):
+            startup_delay = max(0.0, float(os.environ.get("FLEXAVATAR_ANIME_SR_PREWARM_START_DELAY_MS", "1200")) / 1000.0)
+            if startup_delay > 0:
+                time.sleep(startup_delay)
+            frame_number = 0
+            while frame_number < len(poses):
                 if os.environ.get("FLEXAVATAR_DISABLE_ANIME_SR_PREWARM") == "1":
                     break
+                self._wait_for_sr_interaction_pause()
+                self._drain_priority_warmups(max_count=int(os.environ.get("FLEXAVATAR_ANIME_PRIORITY_WARMUPS_PER_STEP", "2")))
+                expression, yaw, pitch, roll = poses[frame_number]
                 with self._sr_warmup_lock:
                     if self._sr_warmup_progress.get("avatar") == asset.name:
-                        self._sr_warmup_progress["currentFrame"] = frame_number
-                self._warm_single_pose(asset, expression, yaw, pitch, roll, 0.0)
+                        self._sr_warmup_progress["currentFrame"] = frame_number + 1
+                completed = self._warm_single_pose(asset, expression, yaw, pitch, roll, 0.0)
+                if not completed:
+                    time.sleep(0.05)
+                    continue
+                frame_number += 1
                 with self._sr_warmup_lock:
                     if self._sr_warmup_progress.get("avatar") == asset.name:
                         self._sr_warmup_progress["processedFrames"] = frame_number
+                self._drain_priority_warmups(max_count=int(os.environ.get("FLEXAVATAR_ANIME_PRIORITY_WARMUPS_PER_STEP", "2")))
         except Exception:
             traceback.print_exc()
         finally:
+            self._drain_priority_warmups(max_count=0)
             with self._sr_warmup_lock:
                 self._sr_warmup_pending.discard(warmup_key)
                 if self._sr_warmup_progress.get("avatar") == asset.name:
@@ -1196,6 +1475,61 @@ class PanicAnimeBackend:
                         "SR prepass complete" if processed >= total else "SR prepass stopped"
                     )
 
+    def _drain_priority_warmups(self, max_count: int = 0):
+        processed = 0
+        while True:
+            with self._sr_warmup_lock:
+                if not self._sr_priority_warmups:
+                    return
+                if max_count > 0 and processed >= max_count:
+                    return
+                item = self._sr_priority_warmups.popleft()
+            self._wait_for_sr_interaction_pause()
+            pose_key, asset, expression, yaw, pitch, roll, wave = item
+            try:
+                completed = self._warm_single_pose(asset, expression, yaw, pitch, roll, wave)
+            except Exception:
+                traceback.print_exc()
+                completed = True
+            finally:
+                processed += 1
+                with self._sr_warmup_lock:
+                    self._sr_warmup_pending.discard(pose_key)
+                    if not completed:
+                        self._sr_warmup_pending.add(pose_key)
+                        self._sr_priority_warmups.appendleft(item)
+                        return
+
+    def _priority_warmup_worker(self):
+        try:
+            self._drain_priority_warmups(max_count=0)
+        finally:
+            with self._sr_warmup_lock:
+                self._sr_priority_worker_active = False
+                should_restart = bool(self._sr_priority_warmups) and not self._sr_warmup_progress.get("active")
+                if should_restart:
+                    self._sr_priority_worker_active = True
+            if should_restart:
+                self._sr_warmup_executor.submit(self._priority_warmup_worker)
+
+    def _pause_sr_for_interaction(self, active: bool = False):
+        pause_seconds = max(0.0, float(os.environ.get("FLEXAVATAR_ANIME_SR_INTERACTION_DEBOUNCE_MS", "900")) / 1000.0)
+        with self._sr_warmup_lock:
+            self._sr_interaction_held = bool(active)
+            self._sr_pause_until = max(self._sr_pause_until, time.time() + pause_seconds)
+
+    def _sr_interaction_active(self):
+        with self._sr_warmup_lock:
+            return bool(getattr(self, "_sr_interaction_held", False)) or time.time() < self._sr_pause_until
+
+    def _wait_for_sr_interaction_pause(self):
+        while True:
+            with self._sr_warmup_lock:
+                wait_seconds = self._sr_pause_until - time.time()
+            if wait_seconds <= 0:
+                return
+            time.sleep(min(wait_seconds, 0.1))
+
     def _warm_single_pose_worker(
         self,
         pose_key: str,
@@ -1207,7 +1541,10 @@ class PanicAnimeBackend:
         wave: float,
     ):
         try:
-            self._warm_single_pose(asset, expression, yaw, pitch, roll, wave)
+            self._wait_for_sr_interaction_pause()
+            completed = self._warm_single_pose(asset, expression, yaw, pitch, roll, wave)
+            if not completed:
+                time.sleep(0.05)
         except Exception:
             traceback.print_exc()
         finally:
@@ -1225,8 +1562,11 @@ class PanicAnimeBackend:
     ):
         image = self._render_tha4_expression(asset, expression, yaw, pitch, roll, wave, warmup=True)
         image = self._crop_to_alpha(image, padding=26)
+        self._store_live_base(self._live_base_cache_key(asset, expression, yaw, pitch, roll, wave), image)
         cache_key = self._sr_pose_cache_key(asset, expression, yaw, pitch, roll, wave)
-        self._get_sr_handler().warm(image, cache_key=cache_key)
+        completed = self._get_sr_handler().warm(image, cache_key=cache_key)
+        if not completed:
+            return False
         sr_image = self._cached_super_resolve_by_key(cache_key)
         if sr_image is not None:
             width = int(os.environ.get("FLEXAVATAR_ANIME_STILL_WIDTH", "1600"))
@@ -1249,6 +1589,7 @@ class PanicAnimeBackend:
             if self._get_final_frame(final_key) is None:
                 payload = self._compose_final_frame(sr_image, width, height, radius, "WEBP", quality)
                 self._store_final_frame(final_key, payload, "WEBP")
+        return True
 
     def _sr_pose_cache_key(
         self,
@@ -1275,7 +1616,7 @@ class PanicAnimeBackend:
         digest.update(os.environ.get("FLEXAVATAR_REALCUGAN_TTA", "1").encode("ascii"))
         digest.update(os.environ.get("FLEXAVATAR_REALCUGAN_TILE", "0").encode("ascii"))
         digest.update(os.environ.get("FLEXAVATAR_REALCUGAN_SYNCGAP", "3").encode("ascii"))
-        digest.update(os.environ.get("FLEXAVATAR_REALCUGAN_JOBS", "1:2:2").encode("ascii"))
+        digest.update(os.environ.get("FLEXAVATAR_REALCUGAN_JOBS", "1:1:1").encode("ascii"))
         digest.update(str([round(float(value), 3) for value in expression[:32]]).encode("ascii"))
         digest.update(f"{yaw:.3f}:{pitch:.3f}:{roll:.3f}:{wave:.3f}".encode("ascii"))
         return digest.hexdigest()
@@ -1560,6 +1901,7 @@ class WebAvatarSession:
             "mode": self.mode,
             "playing": self.playing,
             "lockHead": self.lock_head,
+            "interacting": False,
             "expression": [0.0] * 32,
             "jaw": [0.0, 0.0, 0.0],
             "head": [0.0, 0.0, 0.0],
@@ -1571,6 +1913,11 @@ class WebAvatarSession:
         self._sheap_module = None
         self._panic_driver_prev_gray = None
         self._last_panic_jpeg = None
+        self._last_panic_jpeg_signature = None
+        self._last_panic_render_signature = None
+        self._panic_stream_width = 1280
+        self._panic_stream_height = 720
+        self._panic_stream_quality = 88
 
         self._load_runtime()
         self._animation_thread = Thread(target=self._animate_avatar, daemon=True)
@@ -1764,6 +2111,7 @@ class WebAvatarSession:
             self.busy = False
 
     def apply_controls(self, payload: ControlPayload):
+        panic_warmup = None
         with self.lock:
             self.mode = payload.mode
             self.playing = payload.playing
@@ -1772,6 +2120,7 @@ class WebAvatarSession:
                 "mode": payload.mode,
                 "playing": payload.playing,
                 "lockHead": payload.lock_head,
+                "interacting": payload.interacting,
                 "expression": [float(value) for value in payload.expression[:32]],
                 "jaw": [float(value) for value in payload.jaw[:3]],
                 "head": [float(value) for value in payload.head[:3]],
@@ -1782,13 +2131,21 @@ class WebAvatarSession:
             self.camera.roll = float(camera.get("roll", self.camera.roll))
             self.camera.radius = float(camera.get("radius", self.camera.radius))
             if self.renderer == "panic3d":
+                if self._panic_asset is not None:
+                    panic_warmup = (
+                        self._panic_asset,
+                        replace(self.camera),
+                        self._driver_controls.copy(),
+                        self.frame_index,
+                    )
                 self._set_status("PAniC anime driver controls updated.")
-                return
-            for index, value in enumerate(payload.expression[:100]):
-                self._manual_expression_code[index] = float(value)
-            self._apply_rotation(payload.jaw[:3], 120)
-            self._apply_rotation(payload.head[:3], 126)
-            self._set_status("Preview controls updated.")
+            else:
+                for index, value in enumerate(payload.expression[:100]):
+                    self._manual_expression_code[index] = float(value)
+                self._apply_rotation(payload.jaw[:3], 120)
+                self._apply_rotation(payload.head[:3], 126)
+                self._set_status("Preview controls updated.")
+        return panic_warmup
 
     def _apply_rotation(self, euler_angles: list[float], start: int):
         if len(euler_angles) < 3:
@@ -1807,16 +2164,31 @@ class WebAvatarSession:
                 time.sleep(0.05)
                 continue
 
-            is_non_flex_renderer = False
+            panic_render_args = None
             with self.lock:
                 if self.renderer != "flexavatar":
-                    if self.playing:
+                    if self.renderer == "panic3d" and self._panic_asset is not None:
+                        asset = self._panic_asset
+                        camera = replace(self.camera)
+                        controls = {
+                            "mode": self._driver_controls.get("mode"),
+                            "playing": self._driver_controls.get("playing"),
+                            "lockHead": self._driver_controls.get("lockHead"),
+                            "interacting": self._driver_controls.get("interacting"),
+                            "expression": list(self._driver_controls.get("expression") or []),
+                            "jaw": list(self._driver_controls.get("jaw") or []),
+                            "head": list(self._driver_controls.get("head") or []),
+                        }
+                        width = self._panic_stream_width
+                        height = self._panic_stream_height
+                        quality = self._panic_stream_quality
+                        frame_index = self.frame_index
+                        render_signature = self._panic_render_signature(controls, camera, frame_index, width, height, quality)
+                        if render_signature != self._last_panic_render_signature:
+                            panic_render_args = (asset, camera, controls, frame_index, width, height, quality, render_signature)
+                    if self.playing or self._driver_controls.get("playing"):
                         self.frame_index = (self.frame_index + 1) % 360
-                    now = time.time()
-                    self.animation_fps = int(1 / max(now - last_time, 1e-6))
-                    last_time = now
-                    is_non_flex_renderer = True
-                if not is_non_flex_renderer:
+                else:
                     mode = self.mode
                     playing = self.playing
                     lock_head = self.lock_head
@@ -1830,7 +2202,42 @@ class WebAvatarSession:
                         expression_code = self._expression_codes[self.frame_index]
                         if playing:
                             self.frame_index = (self.frame_index + 1) % len(self._expression_codes)
-            if is_non_flex_renderer:
+
+            if panic_render_args is not None:
+                frame_start = time.time()
+                try:
+                    asset, camera, controls, frame_index, width, height, quality, render_signature = panic_render_args
+                    jpeg, fps = self._panic_backend.render_jpeg(
+                        asset,
+                        camera,
+                        controls,
+                        frame_index,
+                        width,
+                        height,
+                        quality,
+                        "JPEG",
+                    )
+                    now = time.time()
+                    with self.lock:
+                        self.render_fps = fps
+                        self.animation_fps = int(1 / max(now - last_time, 1e-6))
+                        self._last_panic_jpeg = jpeg
+                        self._last_panic_jpeg_signature = (width, height, quality)
+                        self._last_panic_render_signature = render_signature
+                    last_time = now
+                except Exception as exc:
+                    traceback.print_exc()
+                    with self.lock:
+                        self.status = f"Preview render recovered: {exc}"
+                        self.render_fps = 0
+                time.sleep(max(0.0, (1 / 24) - (time.time() - frame_start)))
+                continue
+
+            if self.renderer != "flexavatar":
+                now = time.time()
+                with self.lock:
+                    self.animation_fps = int(1 / max(now - last_time, 1e-6))
+                last_time = now
                 time.sleep(1 / 30)
                 continue
 
@@ -1857,6 +2264,37 @@ class WebAvatarSession:
             with self.lock:
                 self.gaussians = gaussians
 
+    @staticmethod
+    def _panic_render_signature(
+        controls: dict,
+        camera: WebCamera,
+        frame_index: int,
+        width: int,
+        height: int,
+        quality: int,
+    ):
+        mode = str(controls.get("mode", "default"))
+        playing = bool(controls.get("playing", True))
+        animated_frame = frame_index if mode == "default" and playing else 0
+        expression = tuple(round(float(value), 3) for value in (controls.get("expression") or [])[:32])
+        head = tuple(round(float(value), 3) for value in (controls.get("head") or [])[:3])
+        return (
+            mode,
+            playing,
+            bool(controls.get("lockHead")),
+            bool(controls.get("interacting")),
+            expression,
+            head,
+            round(float(camera.yaw), 3),
+            round(float(camera.pitch), 3),
+            round(float(camera.roll), 3),
+            round(float(camera.radius), 3),
+            animated_frame,
+            width,
+            height,
+            quality,
+        )
+
     def render_jpeg(self, width: int = 1280, height: int = 720, quality: int = 90, output_format: str = "JPEG"):
         start = time.time()
         with self.lock:
@@ -1869,6 +2307,7 @@ class WebAvatarSession:
                     "mode": self._driver_controls.get("mode"),
                     "playing": self._driver_controls.get("playing"),
                     "lockHead": self._driver_controls.get("lockHead"),
+                    "interacting": self._driver_controls.get("interacting"),
                     "expression": list(self._driver_controls.get("expression") or []),
                     "jaw": list(self._driver_controls.get("jaw") or []),
                     "head": list(self._driver_controls.get("head") or []),
@@ -1893,6 +2332,8 @@ class WebAvatarSession:
                 with self.lock:
                     self.render_fps = fps
                     self._last_panic_jpeg = jpeg
+                    if output_format.upper() == "JPEG":
+                        self._last_panic_jpeg_signature = (width, height, quality)
                 return jpeg
             except Exception as exc:
                 traceback.print_exc()
@@ -1928,6 +2369,19 @@ class WebAvatarSession:
         image.save(buffer, format="JPEG", quality=quality, optimize=True)
         self.render_fps = int(1 / max(time.time() - start, 1e-6))
         return buffer.getvalue()
+
+    def stream_jpeg(self, width: int = 1280, height: int = 720, quality: int = 88):
+        with self.lock:
+            if self.renderer == "panic3d" and self._panic_asset is not None:
+                self.camera.image_width = width
+                self.camera.image_height = height
+                self._panic_stream_width = width
+                self._panic_stream_height = height
+                self._panic_stream_quality = quality
+                if self._last_panic_jpeg is not None and self._last_panic_jpeg_signature == (width, height, quality):
+                    return self._last_panic_jpeg
+                return self._placeholder_jpeg(width, height, quality)
+        return self.render_jpeg(width, height, quality=quality)
 
     @staticmethod
     def _placeholder_jpeg(width: int, height: int, quality: int = 82):
@@ -2158,8 +2612,13 @@ def api_load_avatar(avatar_name: str):
 
 @app.post("/api/controls")
 def api_controls(payload: ControlPayload):
-    get_session().apply_controls(payload)
-    return {"ok": True, "state": get_session().state()}
+    current_session = get_session()
+    panic_warmup = current_session.apply_controls(payload)
+    if panic_warmup is not None:
+        current_session._panic_backend.note_control_interaction(payload.interacting)
+        if not payload.interacting:
+            current_session._panic_backend.schedule_current_pose_warmup(*panic_warmup)
+    return {"ok": True}
 
 
 @app.get("/api/frame.jpg")
@@ -2186,11 +2645,19 @@ async def api_stream(width: int = 1280, height: int = 720):
     async def frames():
         while True:
             frame_start = time.time()
-            jpeg = get_session().render_jpeg(width, height, quality=88)
+            jpeg = get_session().stream_jpeg(width, height, quality=88)
             yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + jpeg + b"\r\n"
             await asyncio.sleep(max(0.0, (1 / 24) - (time.time() - frame_start)))
 
     return StreamingResponse(frames(), media_type="multipart/x-mixed-replace; boundary=frame")
+
+
+@app.get("/api/debug/render-timings")
+def api_debug_render_timings():
+    current_session = get_session()
+    if getattr(current_session, "_panic_backend", None) is None:
+        return {"count": 0, "recent": []}
+    return current_session._panic_backend.render_timing_stats()
 
 
 @app.post("/api/export-ply")

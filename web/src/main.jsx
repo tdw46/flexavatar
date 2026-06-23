@@ -87,6 +87,7 @@ const toControlPayload = (controls) => ({
   mode: controls.mode,
   playing: controls.playing,
   lock_head: controls.lockHead,
+  interacting: Boolean(controls.interacting),
   expression: normalizeExpression(controls.expression),
   jaw: controls.jaw,
   head: controls.head,
@@ -118,6 +119,7 @@ function App() {
     mode: "default",
     playing: true,
     lockHead: false,
+    interacting: false,
     expression: Array(32).fill(0),
     jaw: [0, 0, 0],
     head: [0, 0, 0],
@@ -133,6 +135,12 @@ function App() {
   const lastBackendControlSignature = React.useRef("");
   const controlPostInFlight = React.useRef(false);
   const queuedControlPayload = React.useRef(null);
+  const lastControlPostAt = React.useRef(0);
+  const rendererRef = React.useRef("");
+
+  React.useEffect(() => {
+    rendererRef.current = state?.renderer ?? "";
+  }, [state?.renderer]);
 
   const pushControls = React.useCallback((nextControls) => {
     queuedControlPayload.current = toControlPayload(nextControls);
@@ -141,18 +149,24 @@ function App() {
     const drainQueue = async () => {
       controlPostInFlight.current = true;
       while (queuedControlPayload.current) {
+        const minInterval = 1000 / 30;
+        const waitMs = Math.max(0, minInterval - (performance.now() - lastControlPostAt.current));
+        if (waitMs > 0) {
+          await new Promise((resolve) => window.setTimeout(resolve, waitMs));
+        }
         const payload = queuedControlPayload.current;
         queuedControlPayload.current = null;
         try {
+          lastControlPostAt.current = performance.now();
           const result = await api("/api/controls", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify(payload),
           });
-          if (result.state) {
-            setState(result.state);
+          if (result.state) setState(result.state);
+          if (rendererRef.current !== "panic3d") {
+            setFrameVersion((value) => value + 1);
           }
-          setFrameVersion((value) => value + 1);
         } catch (error) {
           setNotice(error.message);
         }
@@ -233,6 +247,7 @@ function App() {
       mode: controls.mode,
       playing: controls.playing,
       lockHead: controls.lockHead,
+      interacting: controls.interacting,
       expression: normalizeExpression(controls.expression),
       jaw: controls.jaw,
       head: controls.head,
@@ -421,7 +436,8 @@ function App() {
     ? "warming"
     : `${Number(srWarmup?.processedFrames ?? 0)}-${Number(state?.animeSrCache?.cached ?? 0)}-${Number(srWarmup?.completedAt ?? 0)}`;
   const stillFramePath = state?.renderer === "panic3d" ? "frame.webp" : "frame.jpg";
-  const renderImageUrl = stillFrameMode
+  const useStillFrame = stillFrameMode && state?.renderer !== "panic3d";
+  const renderImageUrl = useStillFrame
     ? `${API_BASE}/api/${stillFramePath}?width=${liveStreamSize.width}&height=${liveStreamSize.height}&v=${frameVersion}&sr=${srWarmupVersion}`
     : `${API_BASE}/api/stream.mjpg?width=${liveStreamSize.width}&height=${liveStreamSize.height}`;
   const displayAvatar = loadedAvatar ?? selectedInput?.avatarName ?? "No avatar loaded";
@@ -725,6 +741,10 @@ function PreviewStep({ controls, setControls, hasAvatar, renderer, animeExpressi
     });
   };
 
+  const setSliderInteracting = (interacting) => {
+    setControls((current) => ({ ...current, mode: "manual", interacting }));
+  };
+
   return (
     <div className="stepPane">
       {!hasAvatar && (
@@ -792,6 +812,7 @@ function PreviewStep({ controls, setControls, hasAvatar, renderer, animeExpressi
             max={control.max}
             step={isPanic ? 0.25 : 0.01}
             onChange={(value) => setExpression(control.index, value)}
+            onInteractionChange={setSliderInteracting}
           />
         ))}
       </section>
@@ -813,6 +834,7 @@ function PreviewStep({ controls, setControls, hasAvatar, renderer, animeExpressi
                 camera: { ...current.camera, [control.key]: Number(value) },
               }))
             }
+            onInteractionChange={setSliderInteracting}
           />
         ))}
       </section>
@@ -835,13 +857,28 @@ function WebcamStep({ webcamOn, setWebcamOn, videoRef }) {
   );
 }
 
-function Slider({ label, value, min, max, step, onChange }) {
+function Slider({ label, value, min, max, step, onChange, onInteractionChange }) {
   const handleInput = (event) => onChange(event.target.value);
+  const startInteraction = () => onInteractionChange?.(true);
+  const endInteraction = () => onInteractionChange?.(false);
 
   return (
     <label className="slider">
       <span>{label}</span>
-      <input type="range" min={min} max={max} step={step} value={value} onInput={handleInput} />
+      <input
+        type="range"
+        min={min}
+        max={max}
+        step={step}
+        value={value}
+        onInput={handleInput}
+        onPointerDown={startInteraction}
+        onPointerUp={endInteraction}
+        onPointerCancel={endInteraction}
+        onBlur={endInteraction}
+        onKeyDown={startInteraction}
+        onKeyUp={endInteraction}
+      />
       <output>{Number(value).toFixed(2)}</output>
     </label>
   );
