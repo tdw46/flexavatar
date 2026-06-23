@@ -83,6 +83,16 @@ const panicCameraControls = [
 const normalizeExpression = (expression, length = 32) =>
   Array.from({ length }, (_, index) => Number(expression?.[index] ?? 0));
 
+const toControlPayload = (controls) => ({
+  mode: controls.mode,
+  playing: controls.playing,
+  lock_head: controls.lockHead,
+  expression: normalizeExpression(controls.expression),
+  jaw: controls.jaw,
+  head: controls.head,
+  camera: controls.camera,
+});
+
 function cx(...classes) {
   return classes.filter(Boolean).join(" ");
 }
@@ -121,29 +131,39 @@ function App() {
   const videoRef = React.useRef(null);
   const driveTimer = React.useRef(null);
   const lastBackendControlSignature = React.useRef("");
+  const controlPostInFlight = React.useRef(false);
+  const queuedControlPayload = React.useRef(null);
 
-  const pushControls = React.useCallback(async (nextControls) => {
-    try {
-      const result = await api("/api/controls", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          mode: nextControls.mode,
-          playing: nextControls.playing,
-          lock_head: nextControls.lockHead,
-          expression: normalizeExpression(nextControls.expression),
-          jaw: nextControls.jaw,
-          head: nextControls.head,
-          camera: nextControls.camera,
-        }),
-      });
-      if (result.state) {
-        setState(result.state);
+  const pushControls = React.useCallback((nextControls) => {
+    queuedControlPayload.current = toControlPayload(nextControls);
+    if (controlPostInFlight.current) return;
+
+    const drainQueue = async () => {
+      controlPostInFlight.current = true;
+      while (queuedControlPayload.current) {
+        const payload = queuedControlPayload.current;
+        queuedControlPayload.current = null;
+        try {
+          const result = await api("/api/controls", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload),
+          });
+          if (result.state) {
+            setState(result.state);
+          }
+          setFrameVersion((value) => value + 1);
+        } catch (error) {
+          setNotice(error.message);
+        }
       }
-      setFrameVersion((value) => value + 1);
-    } catch (error) {
-      setNotice(error.message);
-    }
+      controlPostInFlight.current = false;
+      if (queuedControlPayload.current) {
+        drainQueue();
+      }
+    };
+
+    drainQueue();
   }, []);
 
   const stopWebcam = React.useCallback(() => {
