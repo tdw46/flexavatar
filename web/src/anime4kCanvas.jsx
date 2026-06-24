@@ -521,10 +521,8 @@ function drawCompositedFrame(canvas, imageCanvas, sourceBounds, camera, outputSi
   const containScale = Math.min(targetW / sw, targetH / sh);
   const drawW = Math.max(1, Math.round(sw * containScale));
   const drawH = Math.max(1, Math.round(sh * containScale));
-  const yaw = Number(camera?.yaw ?? 0);
-  const pitch = Number(camera?.pitch ?? 0);
-  const x = Math.round((width - drawW) / 2 + Math.max(-1, Math.min(1, yaw / 40)) * width * 0.035);
-  const y = Math.round((height - drawH) / 2 - Math.max(-1, Math.min(1, pitch / 40)) * height * 0.028);
+  const x = Math.round((width - drawW) / 2);
+  const y = Math.round((height - drawH) / 2);
 
   context.imageSmoothingEnabled = false;
   context.drawImage(imageCanvas, sx, sy, sw, sh, x, y, drawW, drawH);
