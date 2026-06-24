@@ -68,6 +68,21 @@ const panicExpressionControls = [
   { label: "Brow serious", index: 20, min: 0, max: 2 },
 ];
 
+const panicExpressionGroups = [
+  {
+    label: "Brow",
+    indices: [0, 1, 2, 3, 20],
+  },
+  {
+    label: "Mouth",
+    indices: [4, 5, 6, 7, 8, 9, 16, 19],
+  },
+  {
+    label: "Eyes",
+    indices: [10, 11, 12, 13, 14, 15, 17, 18],
+  },
+];
+
 const flexCameraControls = [
   { key: "yaw", label: "yaw", min: -40, max: 40 },
   { key: "pitch", label: "pitch", min: -40, max: 40 },
@@ -705,6 +720,10 @@ function PreviewStep({ controls, setControls, hasAvatar, renderer, animeExpressi
     min: -2,
     max: 2,
   }));
+  const panicControlsByIndex = React.useMemo(
+    () => new Map(panicExpressionControls.map((control) => [control.index, control])),
+    [],
+  );
   const activeCameraControls = isPanic ? panicCameraControls : flexCameraControls;
   const setExpression = (index, value) => {
     setControls((current) => {
@@ -803,18 +822,42 @@ function PreviewStep({ controls, setControls, hasAvatar, renderer, animeExpressi
 
       <section className="sliderGroup">
         <header>{isPanic ? "Anime adapter" : "Expression"}</header>
-        {activeExpressionControls.map((control) => (
-          <Slider
-            key={control.label}
-            label={control.label}
-            value={controls.expression[control.index]}
-            min={control.min}
-            max={control.max}
-            step={isPanic ? 0.25 : 0.01}
-            onChange={(value) => setExpression(control.index, value)}
-            onInteractionChange={setSliderInteracting}
-          />
-        ))}
+        {isPanic ? (
+          panicExpressionGroups.map((group) => (
+            <div className="sliderSubgroup" key={group.label}>
+              <h3>{group.label}</h3>
+              {group.indices.map((index) => {
+                const control = panicControlsByIndex.get(index);
+                if (!control) return null;
+                return (
+                  <Slider
+                    key={control.label}
+                    label={control.label}
+                    value={controls.expression[control.index]}
+                    min={control.min}
+                    max={control.max}
+                    step={0.25}
+                    onChange={(value) => setExpression(control.index, value)}
+                    onInteractionChange={setSliderInteracting}
+                  />
+                );
+              })}
+            </div>
+          ))
+        ) : (
+          activeExpressionControls.map((control) => (
+            <Slider
+              key={control.label}
+              label={control.label}
+              value={controls.expression[control.index]}
+              min={control.min}
+              max={control.max}
+              step={0.01}
+              onChange={(value) => setExpression(control.index, value)}
+              onInteractionChange={setSliderInteracting}
+            />
+          ))
+        )}
       </section>
 
       <section className="sliderGroup">

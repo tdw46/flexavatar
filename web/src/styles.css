@@ -700,6 +700,27 @@ button {
   gap: 10px;
 }
 
+.sliderSubgroup {
+  display: grid;
+  gap: 8px;
+  padding-top: 4px;
+  border-top: 1px solid rgba(54, 80, 88, 0.1);
+}
+
+.sliderSubgroup:first-of-type {
+  border-top: 0;
+  padding-top: 0;
+}
+
+.sliderSubgroup h3 {
+  margin: 0;
+  color: #254954;
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
 .slider {
   display: grid;
   grid-template-columns: 86px 1fr 44px;
