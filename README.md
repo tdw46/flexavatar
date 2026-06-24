@@ -133,7 +133,7 @@ cd web
 npm run dev
 ```
 
-Then open [http://127.0.0.1:5173](http://127.0.0.1:5173).
+Then open [http://127.0.0.1:15173](http://127.0.0.1:15173).
 
 The web viewport streams CUDA-rendered FlexAvatar frames from Python for dynamic animation and can export the current avatar as a web-viewable Gaussian Splat PLY for the integrated Three.js splat viewer.
 

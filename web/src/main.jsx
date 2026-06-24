@@ -20,7 +20,7 @@ import {
 import { Anime4KCanvas } from "./anime4kCanvas.jsx";
 import "./styles.css";
 
-const API_BASE = import.meta.env.VITE_API_BASE ?? "http://127.0.0.1:8000";
+const API_BASE = import.meta.env.VITE_API_BASE ?? "http://127.0.0.1:18000";
 
 const steps = [
   { id: "input", label: "Input", icon: ImagePlus },
@@ -122,6 +122,7 @@ function App() {
     lockHead: false,
     interacting: false,
     anime4k: true,
+    anime4kMode: "anime4k-modeBB",
     expression: Array(32).fill(0),
     jaw: [0, 0, 0],
     head: [0, 0, 0],
@@ -137,7 +138,6 @@ function App() {
   const lastBackendControlSignature = React.useRef("");
   const controlPostInFlight = React.useRef(false);
   const queuedControlPayload = React.useRef(null);
-  const lastControlPostAt = React.useRef(0);
   const rendererRef = React.useRef("");
 
   React.useEffect(() => {
@@ -151,15 +151,9 @@ function App() {
     const drainQueue = async () => {
       controlPostInFlight.current = true;
       while (queuedControlPayload.current) {
-        const minInterval = 1000 / 30;
-        const waitMs = Math.max(0, minInterval - (performance.now() - lastControlPostAt.current));
-        if (waitMs > 0) {
-          await new Promise((resolve) => window.setTimeout(resolve, waitMs));
-        }
         const payload = queuedControlPayload.current;
         queuedControlPayload.current = null;
         try {
-          lastControlPostAt.current = performance.now();
           const result = await api("/api/controls", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
@@ -522,6 +516,7 @@ function App() {
               src={renderImageUrl}
               alt="Avatar live render"
               enabled={anime4kEnabled}
+              mode={controls.anime4kMode}
               camera={controls.camera}
               outputSize={liveStreamSize}
             />
@@ -771,13 +766,37 @@ function PreviewStep({ controls, setControls, hasAvatar, renderer, animeExpressi
         <section className="toggleGroup">
           <label className="toggleOption">
             <span>
-              <strong>Anime4K Fast 4x</strong>
-              <small>Native THA4 source, realtime WebGPU restore + scaler</small>
+              <strong>Realtime upscaler</strong>
+              <small>Native THA4 source, model/shader compare</small>
             </span>
             <button
               className={controls.anime4k ? "switch on" : "switch"}
               onClick={() => setControls((value) => ({ ...value, anime4k: !value.anime4k }))}
             />
+          </label>
+          <label className="modeOption">
+            <span>Upscaler</span>
+            <select
+              value={controls.anime4kMode}
+              disabled={!controls.anime4k}
+              onChange={(event) => setControls((value) => ({ ...value, anime4kMode: event.target.value }))}
+            >
+              <option value="anime4k-modeBB">Anime4K Mode B+B 4x</option>
+              <option value="anime4k-modeAA">Anime4K Mode A+A 4x</option>
+              <option value="anime4k-modeCA">Anime4K Mode C+A 4x</option>
+              <option value="anime4k-modeB">Anime4K Mode B 4x</option>
+              <option value="anime4k-modeA">Anime4K Mode A 4x</option>
+              <option value="anime4k-modeC">Anime4K Mode C 4x</option>
+              <option value="anime4k-clean">Experimental clean chain 4x</option>
+              <option value="anime4k-restore">Experimental crisp chain 4x</option>
+              <option value="anime4k-denoise">Experimental denoise chain 4x</option>
+              <option value="anime4k-gan4x">Experimental GAN chain 4x</option>
+              <option value="anime4k-ultraDetail">Experimental CNN ultra detail 4x</option>
+              <option value="artcnn">ArtCNN C4F32 2x</option>
+              <option value="artcnnDs">ArtCNN C4F32 DS 2x</option>
+              <option value="animejanai">AnimeJaNai V3.1 Sharp 2x</option>
+              <option value="realcugan">Real-CUGAN TF.js 2x</option>
+            </select>
           </label>
         </section>
       )}

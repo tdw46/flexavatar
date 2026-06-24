@@ -1478,7 +1478,10 @@ class UploadResponse(BaseModel):
 app = FastAPI(title="FlexAvatar Web Studio")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_origins=[
+        "http://localhost:15173",
+        "http://127.0.0.1:15173",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -1654,7 +1657,7 @@ if dist_dir.exists():
 def main():
     import uvicorn
 
-    uvicorn.run(app, host="127.0.0.1", port=8000)
+    uvicorn.run(app, host="127.0.0.1", port=18000)
 
 
 if __name__ == "__main__":
